@@ -1,2 +1,76 @@
 # DART
-(Deadline-Aware Reliable Transport) UDP-based protocol prototype BUT with reliablity like TCP/QUIC
+
+DART (Deadline-Aware Reliable Transport) is an educational, message-oriented
+transport protocol built over UDP. Its research goal is to make scheduling and
+retransmission decisions using message deadlines and reliability requirements.
+
+The runnable sender and receiver now use the DART v2 binary packet format. A
+message is split into UDP-sized fragments, each fragment is acknowledged and
+retried when required, and the receiver reassembles the original message before
+delivering it.
+
+This is still a deliberately simple stop-and-wait milestone. DART does not yet
+provide TCP- or QUIC-level congestion control, flow control, security,
+handshakes, scheduling, or multiple packets in flight.
+
+The proposed v2 protocol and its delivery semantics are specified in
+[`docs/protocol-v2.md`](docs/protocol-v2.md). Features described there may still
+be future targets unless the README says they are implemented.
+
+## Run the Demo
+
+Start the receiver:
+
+```bash
+python receiver.py
+```
+
+Send a partially reliable message from another terminal:
+
+```bash
+python sender.py "hello" --mode partial --deadline-ms 1500
+```
+
+The available modes are `unreliable`, `partial`, and `reliable`. Run either
+script with `--help` to see its simulation and timing options.
+
+To demonstrate fragment retransmission, start the receiver with:
+
+```bash
+python receiver.py --drop-first
+```
+
+Then send a message larger than one packet:
+
+```bash
+python sender.py "A long message..." --mode reliable
+```
+
+The sender reports the number of fragments and retries. The receiver delivers
+the text only after every fragment has arrived.
+
+## Implemented Milestone
+
+- Binary `DATA` and `ACK` packets.
+- 64-bit connection and packet numbers.
+- Messages split into payloads of at most 1146 bytes.
+- Out-of-order reassembly and duplicate suppression.
+- Per-fragment ACKs and stop-and-wait retransmission.
+- Unreliable, partial, and reliable sending modes.
+- Sender-side deadline abandonment for partial messages.
+- Simulated data loss, ACK loss, delay, and first-send loss.
+
+## Not Implemented Yet
+
+- Handshake and connection state machine.
+- Sliding send window or multiple packets in flight.
+- Measured RTT and adaptive retransmission timeout.
+- Receiver-side deadline expiration.
+- Deadline-aware queue scheduling.
+- Flow control, congestion control, encryption, or authentication.
+
+## Run Tests
+
+```bash
+python -m unittest discover -s tests -v
+```

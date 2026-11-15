@@ -1,78 +1,129 @@
-"""DART receiver: run this in terminal 1, then start sender.py in terminal 2."""
+"""Simple DART v2 receiver. Run this before sender.py."""
 
 import argparse
 import random
 import socket
 import time
 
-from protocol import MAX_DATAGRAM_BYTES, PacketError, ack_packet, decode_packet, encode_packet
+from dart import (
+    MAX_DATAGRAM_BYTES,
+    AckPacket,
+    DataPacket,
+    MessageReassembler,
+    PacketError,
+    Reliability,
+    decode_packet,
+    encode_packet,
+)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DART receiver (educational UDP server)")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind interface; defaults to localhost")
+    parser = argparse.ArgumentParser(description="Simple DART v2 receiver")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9999)
-    parser.add_argument("--loss", type=float, default=0.0,
-                        help="Simulated DATA packet loss, between 0 and 1")
-    parser.add_argument("--ack-loss", type=float, default=0.0,
-                        help="Simulated ACK packet loss, between 0 and 1")
-    parser.add_argument("--drop-first", action="store_true",
-                        help="Always drop the first copy of each message ID")
-    parser.add_argument("--delay-ms", type=int, default=0,
-                        help="Wait before processing each received datagram")
+    parser.add_argument("--loss", type=float, default=0.0)
+    parser.add_argument("--ack-loss", type=float, default=0.0)
+    parser.add_argument(
+        "--drop-first",
+        action="store_true",
+        help="Drop the first copy of every fragment",
+    )
+    parser.add_argument("--delay-ms", type=int, default=0)
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
-    if not (0 <= args.loss <= 1 and 0 <= args.ack_loss <= 1):
-        parser.error("--loss and --ack-loss must be between 0 and 1")
-    if args.delay_ms < 0 or not (1 <= args.port <= 65535):
-        parser.error("--delay-ms must be >= 0 and port must be 1..65535")
 
-    rng = random.Random(args.seed)
-    seen_ids = set()     # A real implementation would expire old IDs
+    if not (0 <= args.loss <= 1 and 0 <= args.ack_loss <= 1):
+        parser.error("Loss values must be between 0 and 1")
+    if args.delay_ms < 0:
+        parser.error("Delay must be zero or greater")
+    if not 1 <= args.port <= 65535:
+        parser.error("Port must be between 1 and 65535")
+
+    random_generator = random.Random(args.seed)
+    reassembler = MessageReassembler()
     dropped_once = set()
+    next_ack_number = {}
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind((args.host, args.port))
         print(f"[RECEIVER] listening on {args.host}:{args.port} (UDP)", flush=True)
-        print(f"[RECEIVER] loss={args.loss:.0%}, ack-loss={args.ack_loss:.0%}, "
-              f"drop-first={args.drop_first}, delay={args.delay_ms}ms", flush=True)
+
         try:
             while True:
                 raw, address = sock.recvfrom(MAX_DATAGRAM_BYTES + 1)
+
                 try:
                     packet = decode_packet(raw)
-                except PacketError as exc:
-                    print(f"[RECEIVER] ignored malformed packet from {address}: {exc}", flush=True)
-                    continue
-                if packet["type"] != "data":
+                except PacketError as error:
+                    print(f"[RECEIVER] ignored invalid packet: {error}", flush=True)
                     continue
 
-                mid = packet["id"]
-                if args.drop_first and mid not in dropped_once:
-                    dropped_once.add(mid)
-                    print(f"[NETWORK ] dropped first copy of {mid}", flush=True)
+                if not isinstance(packet, DataPacket):
                     continue
-                if rng.random() < args.loss:
-                    print(f"[NETWORK ] randomly dropped {mid}", flush=True)
+
+                packet_key = (packet.connection_id, packet.packet_number)
+                if args.drop_first and packet_key not in dropped_once:
+                    dropped_once.add(packet_key)
+                    print(
+                        f"[NETWORK ] dropped fragment {packet.fragment_index + 1}",
+                        flush=True,
+                    )
+                    continue
+                if random_generator.random() < args.loss:
+                    print(
+                        f"[NETWORK ] randomly dropped packet {packet.packet_number}",
+                        flush=True,
+                    )
                     continue
                 if args.delay_ms:
                     time.sleep(args.delay_ms / 1000)
 
-                if mid in seen_ids:
-                    print(f"[RECEIVER] duplicate {mid}; ACK again (do not deliver twice)", flush=True)
-                else:
-                    seen_ids.add(mid)
-                    print(f"[RECEIVER] delivered {mid}: {packet['data']!r} "
-                          f"[{packet['mode']}]", flush=True)
+                message_key = (packet.connection_id, packet.message_id)
+                was_already_complete = message_key in reassembler.completed
 
-                # Unreliable data is delivered, but does not require an ACK.
-                if packet["mode"] == "unreliable":
+                try:
+                    complete_message = reassembler.add(packet)
+                except PacketError as error:
+                    print(f"[RECEIVER] rejected fragment: {error}", flush=True)
                     continue
-                if rng.random() < args.ack_loss:
-                    print(f"[NETWORK ] ACK for {mid} lost", flush=True)
+
+                if was_already_complete:
+                    print("[RECEIVER] duplicate fragment; not delivered again", flush=True)
+                elif complete_message is not None:
+                    try:
+                        displayed_message = complete_message.decode("utf-8")
+                    except UnicodeDecodeError:
+                        displayed_message = repr(complete_message)
+                    print(
+                        f"[RECEIVER] delivered complete message: "
+                        f"{displayed_message!r}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[RECEIVER] stored fragment "
+                        f"{packet.fragment_index + 1}/{packet.fragment_count}",
+                        flush=True,
+                    )
+
+                if packet.reliability == Reliability.UNRELIABLE:
                     continue
-                sock.sendto(encode_packet(ack_packet(mid)), address)
-                print(f"[RECEIVER] ACK sent for {mid}", flush=True)
+                if random_generator.random() < args.ack_loss:
+                    print("[NETWORK ] ACK lost", flush=True)
+                    continue
+
+                ack_number = next_ack_number.get(packet.connection_id, 0)
+                next_ack_number[packet.connection_id] = ack_number + 1
+                ack = AckPacket(
+                    connection_id=packet.connection_id,
+                    packet_number=ack_number,
+                    largest_acknowledged=packet.packet_number,
+                )
+                sock.sendto(encode_packet(ack), address)
+                print(
+                    f"[RECEIVER] ACK sent for packet {packet.packet_number}",
+                    flush=True,
+                )
         except KeyboardInterrupt:
             print("\n[RECEIVER] stopped")
 
