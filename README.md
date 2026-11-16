@@ -10,9 +10,9 @@ retried when required, and the receiver reassembles the original message before
 delivering it.
 
 This is still a deliberately simple prototype, but it can keep several packets
-in flight using a fixed sliding window. DART does not yet provide TCP- or
-QUIC-level congestion control, flow control, security, handshakes, or deadline
-queue scheduling.
+in flight and adjusts that number after ACKs and packet loss. DART does not yet
+provide production-grade congestion control, flow control, security, handshakes,
+or deadline queue scheduling.
 
 The proposed v2 protocol and its delivery semantics are specified in
 [`docs/protocol-v2.md`](docs/protocol-v2.md). Features described there may still
@@ -56,7 +56,9 @@ the text only after every fragment has arrived.
 - 64-bit connection and packet numbers.
 - Messages split into payloads of at most 1146 bytes.
 - Out-of-order reassembly and duplicate suppression.
-- A configurable fixed sliding window with multiple packets in flight.
+- A sliding window with a configurable maximum size.
+- Minimal AIMD congestion control: additive growth after ACKs and window halving
+  after a timeout.
 - Selective ACK bitmaps that can acknowledge up to 65 packet numbers.
 - Per-fragment timeout and retransmission.
 - Measured RTT and an automatically adjusted retransmission timeout.
@@ -72,7 +74,8 @@ the text only after every fragment has arrived.
 - Receiver-side deadline expiration.
 - Deadline-aware queue scheduling.
 - Receiver-advertised flow control.
-- Congestion control, encryption, or authentication.
+- Packet pacing or production-grade congestion fairness.
+- Encryption or authentication.
 
 ## Run Tests
 

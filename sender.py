@@ -9,6 +9,7 @@ import uuid
 from dart import (
     MAX_DATAGRAM_BYTES,
     AckPacket,
+    CongestionController,
     PacketError,
     Reliability,
     RttEstimator,
@@ -50,11 +51,12 @@ def send_message(
     started = time.monotonic()
     expires_at = started + deadline_ms / 1000 if mode == "partial" else None
     rtt = RttEstimator(estimated_rtt_ms, timeout_ms)
+    congestion = CongestionController(window_size)
     total_attempts = 0
 
     print(
         f"[SENDER  ] connection={connection_id}, mode={mode}, "
-        f"fragments={len(packets)}, window={window_size}",
+        f"fragments={len(packets)}, max-window={window_size}",
         flush=True,
     )
 
@@ -78,13 +80,13 @@ def send_message(
         if expires_at is not None:
             remaining_ms = (expires_at - time.monotonic()) * 1000
             packets_left = len(packets) - delivered_count
-            rounds_left = math.ceil(packets_left / window_size)
+            rounds_left = math.ceil(packets_left / congestion.window)
             if remaining_ms < rtt.rtt_ms * rounds_left:
                 print("[SENDER  ] ABANDON: not enough time before deadline")
                 return 2
 
         # Fill all free places in the window.
-        while next_packet < len(packets) and len(in_flight) < window_size:
+        while next_packet < len(packets) and len(in_flight) < congestion.window:
             packet = packets[next_packet]
             raw = encode_packet(packet)
             sock.sendto(raw, destination)
@@ -140,10 +142,12 @@ def send_message(
                     delivered_count += 1
 
                 if acknowledged:
+                    congestion.packets_acked(len(acknowledged))
                     print(
                         f"[SENDER  ] ACK covered {len(acknowledged)} packet(s) "
                         f"(RTT={rtt.rtt_ms:.0f}ms, "
-                        f"timeout={rtt.timeout_ms:.0f}ms)",
+                        f"timeout={rtt.timeout_ms:.0f}ms, "
+                        f"window={congestion.window})",
                         flush=True,
                     )
 
@@ -162,6 +166,11 @@ def send_message(
                     return 1
 
             rtt.packet_timed_out()
+            congestion.packet_loss()
+            print(
+                f"[SENDER  ] packet loss: window reduced to {congestion.window}",
+                flush=True,
+            )
             for state in timed_out:
                 state["attempts"] += 1
                 state["sent_at"] = time.monotonic()

@@ -1,6 +1,7 @@
 """DART v2 transport package."""
 
 from .ack import AckTracker
+from .congestion import CongestionController
 from .message import MessageReassembler, fragment_message
 from .packet import (
     MAX_DATAGRAM_BYTES,
@@ -17,6 +18,7 @@ from .rtt import RttEstimator
 __all__ = [
     "MAX_DATAGRAM_BYTES",
     "AckTracker",
+    "CongestionController",
     "AckPacket",
     "DataPacket",
     "MessageReassembler",

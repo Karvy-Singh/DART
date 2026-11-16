@@ -4,9 +4,10 @@
 
 This document defines the target behavior for DART v2. The repository currently
 implements binary `DATA` and `ACK` packets, message fragmentation and reassembly,
-a fixed sliding window with selective ACKs, and measured RTT with an adaptive
-timeout. The connection, scheduling, flow-control, and congestion-control
-sections remain targets for later milestones.
+a sliding window with selective ACKs, measured RTT with an adaptive timeout, and
+minimal AIMD congestion-window adjustment. The connection, scheduling,
+flow-control, pacing, and production-grade congestion-control sections remain
+targets for later milestones.
 
 ## Purpose
 
@@ -218,13 +219,17 @@ control or reliable messages.
 
 ## Congestion And Flow Control
 
-Before DART permits a large number of packets in flight, it must implement:
+The current learning controller starts with one packet in flight. After one
+window of successful acknowledgements it increases the window by one. A timeout
+halves the window, with a minimum of one packet. The `--window-size` setting is
+the maximum congestion window.
+
+The following pieces remain future work:
 
 - Receiver-advertised flow-control capacity.
-- Bytes-in-flight accounting.
-- RTT and retransmission-timeout estimation.
-- Congestion-window reduction after detected congestion.
-- Packet pacing and timeout backoff.
+- Packet pacing.
+- More accurate congestion detection and recovery.
+- Fairness evaluation against established transports.
 
 Performance comparisons without these controls must not claim fairness against
 TCP or QUIC.
