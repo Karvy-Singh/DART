@@ -56,15 +56,17 @@ the text only after every fragment has arrived.
 - Messages split into payloads of at most 1146 bytes.
 - Out-of-order reassembly and duplicate suppression.
 - Per-fragment ACKs and stop-and-wait retransmission.
+- Measured RTT and an automatically adjusted retransmission timeout.
+- Timeout backoff after packet loss.
 - Unreliable, partial, and reliable sending modes.
-- Sender-side deadline abandonment for partial messages.
+- Sender-side deadline abandonment based on the estimated time needed for all
+  remaining fragments.
 - Simulated data loss, ACK loss, delay, and first-send loss.
 
 ## Not Implemented Yet
 
 - Handshake and connection state machine.
 - Sliding send window or multiple packets in flight.
-- Measured RTT and adaptive retransmission timeout.
 - Receiver-side deadline expiration.
 - Deadline-aware queue scheduling.
 - Flow control, congestion control, encryption, or authentication.

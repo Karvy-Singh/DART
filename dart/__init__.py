@@ -11,6 +11,7 @@ from .packet import (
     decode_packet,
     encode_packet,
 )
+from .rtt import RttEstimator
 
 __all__ = [
     "MAX_DATAGRAM_BYTES",
@@ -20,6 +21,7 @@ __all__ = [
     "PacketError",
     "PacketType",
     "Reliability",
+    "RttEstimator",
     "decode_packet",
     "encode_packet",
     "fragment_message",

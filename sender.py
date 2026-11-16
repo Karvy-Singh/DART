@@ -10,6 +10,7 @@ from dart import (
     AckPacket,
     PacketError,
     Reliability,
+    RttEstimator,
     decode_packet,
     encode_packet,
     fragment_message,
@@ -49,6 +50,7 @@ def send_message(
     started = time.monotonic()
     expires_at = started + deadline_ms / 1000 if mode == "partial" else None
     total_attempts = 0
+    rtt = RttEstimator(estimated_rtt_ms, timeout_ms)
 
     print(
         f"[SENDER  ] connection={connection_id}, mode={mode}, "
@@ -74,10 +76,13 @@ def send_message(
         for attempt in range(1, max_attempts + 1):
             if expires_at is not None:
                 remaining_ms = (expires_at - time.monotonic()) * 1000
-                if remaining_ms < estimated_rtt_ms:
+                fragments_left = len(packets) - packet.fragment_index
+                estimated_delivery_ms = rtt.rtt_ms * fragments_left
+                if remaining_ms < estimated_delivery_ms:
                     print("[SENDER  ] ABANDON: not enough time before deadline")
                     return 2
 
+            sent_at = time.monotonic()
             sock.sendto(raw, destination)
             total_attempts += 1
             print(
@@ -86,7 +91,7 @@ def send_message(
                 flush=True,
             )
 
-            wait_seconds = timeout_ms / 1000
+            wait_seconds = rtt.timeout_ms / 1000
             if expires_at is not None:
                 wait_seconds = min(
                     wait_seconds,
@@ -118,13 +123,19 @@ def send_message(
                     break
 
             if fragment_delivered:
+                # A retransmitted packet gives an ambiguous RTT measurement.
+                if attempt == 1:
+                    measured_rtt_ms = (time.monotonic() - sent_at) * 1000
+                    rtt.add_measurement(measured_rtt_ms)
                 print(
                     f"[SENDER  ] ACK for fragment "
-                    f"{fragment_number}/{len(packets)}",
+                    f"{fragment_number}/{len(packets)} "
+                    f"(RTT={rtt.rtt_ms:.0f}ms, timeout={rtt.timeout_ms:.0f}ms)",
                     flush=True,
                 )
                 break
 
+            rtt.packet_timed_out()
             print("[SENDER  ] no ACK, retrying", flush=True)
 
         if not fragment_delivered:
@@ -149,8 +160,18 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9999)
     parser.add_argument("--deadline-ms", type=int, default=1500)
-    parser.add_argument("--timeout-ms", type=int, default=250)
-    parser.add_argument("--estimated-rtt-ms", type=int, default=100)
+    parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=250,
+        help="Initial ACK timeout; DART adjusts it after measuring RTT",
+    )
+    parser.add_argument(
+        "--estimated-rtt-ms",
+        type=int,
+        default=100,
+        help="Initial RTT guess used before the first measurement",
+    )
     parser.add_argument("--max-attempts", type=int, default=10)
     args = parser.parse_args()
 
