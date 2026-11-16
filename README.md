@@ -4,6 +4,10 @@ DART (Deadline-Aware Reliable Transport) is an educational, message-oriented
 transport protocol built over UDP. Its research goal is to make scheduling and
 retransmission decisions using message deadlines and reliability requirements.
 
+The current project is a runnable minimum transport: it can send text and files
+between two devices using DART's own packet format, fragmentation, ACKs,
+retransmission, sliding window, RTT estimation, and basic congestion control.
+
 The runnable sender and receiver now use the DART v2 binary packet format. A
 message is split into UDP-sized fragments, each fragment is acknowledged and
 retried when required, and the receiver reassembles the original message before
@@ -34,6 +38,40 @@ python sender.py "hello" --mode partial --deadline-ms 1500
 
 The available modes are `unreliable`, `partial`, and `reliable`. Run either
 script with `--help` to see its simulation and timing options.
+
+## Send A File
+
+Start the receiver:
+
+```bash
+python receiver.py --output-dir received
+```
+
+Send any file from another terminal:
+
+```bash
+python sender.py --file example.pdf --mode reliable
+```
+
+The received file is saved as `received/example.pdf`. Binary files are supported;
+the file does not need to contain text.
+
+## Send Between Two Devices
+
+Both devices must be on a network where UDP port `9999` is reachable. On the
+receiving device, listen on all interfaces:
+
+```bash
+python receiver.py --host 0.0.0.0 --port 9999 --output-dir received
+```
+
+On the sending device, replace the address with the receiver's IP:
+
+```bash
+python sender.py --host 192.168.1.50 --port 9999 --file example.pdf --mode reliable
+```
+
+Allow UDP port `9999` through the receiving device's firewall if necessary.
 
 To demonstrate fragment retransmission, start the receiver with:
 
@@ -67,6 +105,7 @@ the text only after every fragment has arrived.
 - Sender-side deadline abandonment based on the estimated time needed for all
   remaining fragments.
 - Simulated data loss, ACK loss, delay, and first-send loss.
+- Text and binary file transfer applications.
 
 ## Not Implemented Yet
 
@@ -76,6 +115,10 @@ the text only after every fragment has arrived.
 - Receiver-advertised flow control.
 - Packet pacing or production-grade congestion fairness.
 - Encryption or authentication.
+
+This is an educational prototype. Do not expose it directly to the public
+internet because packets and transferred files are not encrypted or
+authenticated.
 
 ## Run Tests
 

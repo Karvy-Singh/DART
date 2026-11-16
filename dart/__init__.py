@@ -1,6 +1,7 @@
 """DART v2 transport package."""
 
 from .ack import AckTracker
+from .application import decode_message, encode_file, encode_text
 from .congestion import CongestionController
 from .message import MessageReassembler, fragment_message
 from .packet import (
@@ -27,6 +28,9 @@ __all__ = [
     "Reliability",
     "RttEstimator",
     "decode_packet",
+    "decode_message",
+    "encode_file",
     "encode_packet",
+    "encode_text",
     "fragment_message",
 ]

@@ -2,6 +2,7 @@
 
 import argparse
 import math
+from pathlib import Path
 import socket
 import time
 import uuid
@@ -14,7 +15,9 @@ from dart import (
     Reliability,
     RttEstimator,
     decode_packet,
+    encode_file,
     encode_packet,
+    encode_text,
     fragment_message,
 )
 
@@ -29,7 +32,7 @@ MODE_NAMES = {
 def send_message(
     sock,
     destination,
-    message,
+    data,
     mode,
     deadline_ms,
     timeout_ms,
@@ -41,7 +44,7 @@ def send_message(
     connection_id = uuid.uuid4().int & ((1 << 64) - 1) or 1
     reliability = MODE_NAMES[mode]
     packets = fragment_message(
-        message.encode("utf-8"),
+        data,
         connection_id=connection_id,
         first_packet_number=0,
         reliability=reliability,
@@ -193,7 +196,8 @@ def send_message(
 
 def main():
     parser = argparse.ArgumentParser(description="Simple DART v2 sender")
-    parser.add_argument("message", help="Text to send")
+    parser.add_argument("message", nargs="?", help="Text to send")
+    parser.add_argument("--file", help="File to send instead of text")
     parser.add_argument("--mode", choices=MODE_NAMES, default="partial")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9999)
@@ -219,6 +223,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if (args.message is None) == (args.file is None):
+        parser.error("Provide either a text message or --file, but not both")
+
     if min(
         args.deadline_ms,
         args.timeout_ms,
@@ -231,12 +238,19 @@ def main():
         parser.error("Port must be between 1 and 65535")
 
     try:
+        if args.file:
+            file_path = Path(args.file)
+            data = encode_file(file_path.name, file_path.read_bytes())
+            print(f"[SENDER  ] sending file {file_path.name!r}")
+        else:
+            data = encode_text(args.message)
+
         destination = (socket.gethostbyname(args.host), args.port)
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             return send_message(
                 sock,
                 destination,
-                args.message,
+                data,
                 args.mode,
                 args.deadline_ms,
                 args.timeout_ms,

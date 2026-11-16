@@ -1,6 +1,7 @@
 """Simple DART v2 receiver. Run this before sender.py."""
 
 import argparse
+from pathlib import Path
 import random
 import socket
 import time
@@ -13,6 +14,7 @@ from dart import (
     MessageReassembler,
     PacketError,
     Reliability,
+    decode_message,
     decode_packet,
     encode_packet,
 )
@@ -31,6 +33,11 @@ def main():
     )
     parser.add_argument("--delay-ms", type=int, default=0)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--output-dir",
+        default="received",
+        help="Directory where received files are saved",
+    )
     args = parser.parse_args()
 
     if not (0 <= args.loss <= 1 and 0 <= args.ack_loss <= 1):
@@ -93,14 +100,27 @@ def main():
                     print("[RECEIVER] duplicate fragment; not delivered again", flush=True)
                 elif complete_message is not None:
                     try:
-                        displayed_message = complete_message.decode("utf-8")
-                    except UnicodeDecodeError:
-                        displayed_message = repr(complete_message)
-                    print(
-                        f"[RECEIVER] delivered complete message: "
-                        f"{displayed_message!r}",
-                        flush=True,
-                    )
+                        kind, filename, content = decode_message(complete_message)
+                        if kind == "text":
+                            print(
+                                f"[RECEIVER] delivered text: {content!r}",
+                                flush=True,
+                            )
+                        else:
+                            output_dir = Path(args.output_dir)
+                            output_dir.mkdir(parents=True, exist_ok=True)
+                            output_path = output_dir / filename
+                            output_path.write_bytes(content)
+                            print(
+                                f"[RECEIVER] saved file: {output_path} "
+                                f"({len(content)} bytes)",
+                                flush=True,
+                            )
+                    except (OSError, UnicodeError, ValueError) as error:
+                        print(
+                            f"[RECEIVER] could not deliver message: {error}",
+                            flush=True,
+                        )
                 else:
                     print(
                         f"[RECEIVER] stored fragment "
