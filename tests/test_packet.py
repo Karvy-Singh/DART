@@ -7,12 +7,59 @@ from dart.packet import (
     MAX_DATAGRAM_BYTES,
     MAX_PAYLOAD_BYTES,
     AckPacket,
+    ClosePacket,
     DataPacket,
+    HelloAckPacket,
+    HelloPacket,
     PacketError,
+    PacketType,
     Reliability,
     decode_packet,
     encode_packet,
 )
+
+
+class HandshakePacketTests(unittest.TestCase):
+    def test_packet_type_numbers(self):
+        self.assertEqual(PacketType.HELLO, 1)
+        self.assertEqual(PacketType.HELLO_ACK, 2)
+        self.assertEqual(PacketType.DATA, 3)
+        self.assertEqual(PacketType.ACK, 4)
+        self.assertEqual(PacketType.CLOSE, 5)
+
+    def test_hello_packets_round_trip(self):
+        packets = (
+            HelloPacket(10, 1, receive_window=64),
+            HelloAckPacket(10, 2, receive_window=128, flags=1),
+        )
+
+        for packet in packets:
+            with self.subTest(packet=packet):
+                self.assertEqual(decode_packet(encode_packet(packet)), packet)
+
+    def test_receive_window_must_be_in_range(self):
+        for receive_window in (0, 65536, True):
+            with self.subTest(receive_window=receive_window):
+                with self.assertRaisesRegex(PacketError, "Receive window"):
+                    encode_packet(HelloPacket(10, 1, receive_window))
+
+    def test_zero_receive_window_is_rejected_when_decoding(self):
+        raw = bytearray(encode_packet(HelloPacket(10, 1, 1)))
+        struct.pack_into("!H", raw, len(raw) - 2, 0)
+
+        with self.assertRaisesRegex(PacketError, "Receive window"):
+            decode_packet(bytes(raw))
+
+    def test_close_packet_round_trip(self):
+        packet = ClosePacket(10, 3, flags=2)
+
+        self.assertEqual(decode_packet(encode_packet(packet)), packet)
+
+    def test_close_packet_rejects_a_body(self):
+        raw = encode_packet(ClosePacket(10, 3))
+
+        with self.assertRaisesRegex(PacketError, "invalid length"):
+            decode_packet(raw + b"extra")
 
 
 class DataPacketTests(unittest.TestCase):
@@ -27,6 +74,7 @@ class DataPacketTests(unittest.TestCase):
             "reliability": Reliability.PARTIAL,
             "priority": 7,
             "deadline_ms": 80,
+            "created_at_ms": 1_700_000_000_000,
             "payload": b"frame fragment",
         }
         values.update(changes)
@@ -131,6 +179,7 @@ class MalformedPacketTests(unittest.TestCase):
                 reliability=Reliability.RELIABLE,
                 priority=0,
                 deadline_ms=None,
+                created_at_ms=0,
                 payload=b"data",
             )
         )

@@ -60,6 +60,32 @@ class FragmentationTests(unittest.TestCase):
         with self.assertRaisesRegex(PacketError, "different metadata"):
             reassembler.add(changed_packet)
 
+    def test_incomplete_partial_message_expires(self):
+        packets = fragment_message(
+            b"x" * (MAX_PAYLOAD_BYTES + 10),
+            connection_id=123,
+            first_packet_number=1,
+            reliability=Reliability.PARTIAL,
+            deadline_ms=50,
+            created_at_ms=1000,
+        )
+        reassembler = MessageReassembler()
+        reassembler.add(packets[0])
+
+        expired = reassembler.expire(1050)
+
+        self.assertEqual(expired, [(123, packets[0].message_id)])
+        self.assertEqual(reassembler.incomplete, {})
+
+    def test_connection_cleanup_removes_completed_state(self):
+        packet = self.make_packets(b"hello")[0]
+        reassembler = MessageReassembler()
+        reassembler.add(packet)
+
+        reassembler.remove_connection(packet.connection_id)
+
+        self.assertEqual(reassembler.completed, set())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,25 +1,13 @@
-"""Simple DART v2 sender. Start receiver.py before running this file."""
+"""DART sender for text, files, and deadline-aware JSON batches."""
 
 import argparse
-import math
+import json
 from pathlib import Path
 import socket
 import time
-import uuid
 
-from dart import (
-    MAX_DATAGRAM_BYTES,
-    AckPacket,
-    CongestionController,
-    PacketError,
-    Reliability,
-    RttEstimator,
-    decode_packet,
-    encode_file,
-    encode_packet,
-    encode_text,
-    fragment_message,
-)
+from dart import DeadlineScheduler, Reliability, encode_file, encode_text
+from dart.client import DartClient
 
 
 MODE_NAMES = {
@@ -29,236 +17,169 @@ MODE_NAMES = {
 }
 
 
-def send_message(
-    sock,
-    destination,
-    data,
-    mode,
-    deadline_ms,
-    timeout_ms,
-    estimated_rtt_ms,
-    max_attempts,
-    window_size,
-):
-    """Send one text message with a small fixed sliding window."""
-    connection_id = uuid.uuid4().int & ((1 << 64) - 1) or 1
-    reliability = MODE_NAMES[mode]
-    packets = fragment_message(
-        data,
-        connection_id=connection_id,
-        first_packet_number=0,
-        reliability=reliability,
-        deadline_ms=deadline_ms if mode == "partial" else None,
-    )
+def make_item(data, label, mode, deadline_ms, priority):
+    if mode not in MODE_NAMES:
+        raise ValueError(f"Unknown mode: {mode}")
+    if not 0 <= priority <= 255:
+        raise ValueError("Priority must be between 0 and 255")
+    if mode == "partial" and (deadline_ms is None or deadline_ms <= 0):
+        raise ValueError("Partial messages need a positive deadline_ms")
 
-    started = time.monotonic()
-    expires_at = started + deadline_ms / 1000 if mode == "partial" else None
-    rtt = RttEstimator(estimated_rtt_ms, timeout_ms)
-    congestion = CongestionController(window_size)
-    total_attempts = 0
+    created_at_ms = int(time.time() * 1000)
+    local_now_ms = int(time.monotonic() * 1000)
+    return {
+        "data": data,
+        "label": label,
+        "reliability": MODE_NAMES[mode],
+        "deadline_ms": deadline_ms if mode == "partial" else None,
+        "deadline_at_ms": (
+            local_now_ms + deadline_ms if mode == "partial" else None
+        ),
+        "priority": priority,
+        "created_at_ms": created_at_ms,
+    }
 
-    print(
-        f"[SENDER  ] connection={connection_id}, mode={mode}, "
-        f"fragments={len(packets)}, max-window={window_size}",
-        flush=True,
-    )
 
-    # Unreliable packets are sent once and do not need a window or ACKs.
-    if mode == "unreliable":
-        for packet in packets:
-            sock.sendto(encode_packet(packet), destination)
-            print(
-                f"[SENDER  ] sent fragment "
-                f"{packet.fragment_index + 1}/{len(packets)} once",
-                flush=True,
+def load_batch(path):
+    """Load text/file messages from a small JSON array."""
+    batch_path = Path(path)
+    entries = json.loads(batch_path.read_text(encoding="utf-8"))
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Batch must be a non-empty JSON array")
+
+    items = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("Every batch entry must be an object")
+        has_text = "text" in entry
+        has_file = "file" in entry
+        if has_text == has_file:
+            raise ValueError("Each batch entry needs either text or file")
+
+        if has_text:
+            data = encode_text(str(entry["text"]))
+            label = f"text {entry['text']!r}"
+        else:
+            file_path = batch_path.parent / entry["file"]
+            data = encode_file(file_path.name, file_path.read_bytes())
+            label = f"file {file_path.name!r}"
+
+        items.append(
+            make_item(
+                data,
+                label,
+                entry.get("mode", "reliable"),
+                entry.get("deadline_ms"),
+                int(entry.get("priority", 0)),
             )
-        print("[SENDER  ] finished: delivery is not confirmed")
-        return 0
-
-    next_packet = 0
-    delivered_count = 0
-    in_flight = {}
-
-    while delivered_count < len(packets):
-        if expires_at is not None:
-            remaining_ms = (expires_at - time.monotonic()) * 1000
-            packets_left = len(packets) - delivered_count
-            rounds_left = math.ceil(packets_left / congestion.window)
-            if remaining_ms < rtt.rtt_ms * rounds_left:
-                print("[SENDER  ] ABANDON: not enough time before deadline")
-                return 2
-
-        # Fill all free places in the window.
-        while next_packet < len(packets) and len(in_flight) < congestion.window:
-            packet = packets[next_packet]
-            raw = encode_packet(packet)
-            sock.sendto(raw, destination)
-            in_flight[packet.packet_number] = {
-                "packet": packet,
-                "raw": raw,
-                "attempts": 1,
-                "sent_at": time.monotonic(),
-            }
-            total_attempts += 1
-            next_packet += 1
-            print(
-                f"[SENDER  ] sent fragment "
-                f"{packet.fragment_index + 1}/{len(packets)}",
-                flush=True,
-            )
-
-        # Wait for an ACK, but never wait past the next packet timeout.
-        now = time.monotonic()
-        next_timeout = min(
-            state["sent_at"] + rtt.timeout_ms / 1000
-            for state in in_flight.values()
         )
-        wait_seconds = max(0.001, next_timeout - now)
-        if expires_at is not None:
-            wait_seconds = min(wait_seconds, max(0.001, expires_at - now))
-        sock.settimeout(wait_seconds)
-
-        try:
-            raw_ack, peer = sock.recvfrom(MAX_DATAGRAM_BYTES + 1)
-        except socket.timeout:
-            raw_ack = None
-            peer = None
-
-        if raw_ack is not None and peer == destination:
-            try:
-                ack = decode_packet(raw_ack)
-            except PacketError:
-                ack = None
-
-            if isinstance(ack, AckPacket) and ack.connection_id == connection_id:
-                acknowledged = [
-                    number for number in in_flight if ack.acknowledges(number)
-                ]
-
-                for number in acknowledged:
-                    state = in_flight.pop(number)
-                    if state["attempts"] == 1:
-                        measured_ms = (
-                            time.monotonic() - state["sent_at"]
-                        ) * 1000
-                        rtt.add_measurement(measured_ms)
-                    delivered_count += 1
-
-                if acknowledged:
-                    congestion.packets_acked(len(acknowledged))
-                    print(
-                        f"[SENDER  ] ACK covered {len(acknowledged)} packet(s) "
-                        f"(RTT={rtt.rtt_ms:.0f}ms, "
-                        f"timeout={rtt.timeout_ms:.0f}ms, "
-                        f"window={congestion.window})",
-                        flush=True,
-                    )
-
-        # Retry packets that have waited longer than the current timeout.
-        now = time.monotonic()
-        timed_out = [
-            state
-            for state in in_flight.values()
-            if now - state["sent_at"] >= rtt.timeout_ms / 1000
-        ]
-        if timed_out:
-            for state in timed_out:
-                if state["attempts"] >= max_attempts:
-                    fragment = state["packet"].fragment_index + 1
-                    print(f"[SENDER  ] FAILED on fragment {fragment}")
-                    return 1
-
-            rtt.packet_timed_out()
-            congestion.packet_loss()
-            print(
-                f"[SENDER  ] packet loss: window reduced to {congestion.window}",
-                flush=True,
-            )
-            for state in timed_out:
-                state["attempts"] += 1
-                state["sent_at"] = time.monotonic()
-                sock.sendto(state["raw"], destination)
-                total_attempts += 1
-                print(
-                    f"[SENDER  ] retry fragment "
-                    f"{state['packet'].fragment_index + 1}, "
-                    f"attempt {state['attempts']}",
-                    flush=True,
-                )
-
-    elapsed_ms = (time.monotonic() - started) * 1000
-    print(
-        f"[SENDER  ] complete after {total_attempts} transmission(s), "
-        f"{elapsed_ms:.0f}ms",
-    )
-    return 0
+    return items
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Simple DART v2 sender")
+    parser = argparse.ArgumentParser(description="DART v3 sender")
     parser.add_argument("message", nargs="?", help="Text to send")
     parser.add_argument("--file", help="File to send instead of text")
+    parser.add_argument("--batch", help="JSON file containing multiple messages")
     parser.add_argument("--mode", choices=MODE_NAMES, default="partial")
+    parser.add_argument("--priority", type=int, default=0)
+    parser.add_argument("--deadline-ms", type=int, default=1500)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9999)
-    parser.add_argument("--deadline-ms", type=int, default=1500)
-    parser.add_argument(
-        "--timeout-ms",
-        type=int,
-        default=250,
-        help="Initial ACK timeout; DART adjusts it after measuring RTT",
-    )
-    parser.add_argument(
-        "--estimated-rtt-ms",
-        type=int,
-        default=100,
-        help="Initial RTT guess used before the first measurement",
-    )
+    parser.add_argument("--timeout-ms", type=int, default=250)
+    parser.add_argument("--estimated-rtt-ms", type=int, default=100)
     parser.add_argument("--max-attempts", type=int, default=10)
-    parser.add_argument(
-        "--window-size",
-        type=int,
-        default=4,
-        help="Maximum number of unacknowledged fragments",
-    )
+    parser.add_argument("--window-size", type=int, default=8)
     args = parser.parse_args()
 
-    if (args.message is None) == (args.file is None):
-        parser.error("Provide either a text message or --file, but not both")
-
+    source_count = sum(
+        source is not None for source in (args.message, args.file, args.batch)
+    )
+    if source_count != 1:
+        parser.error("Provide exactly one of message, --file, or --batch")
+    if not 1 <= args.port <= 65535:
+        parser.error("Port must be between 1 and 65535")
     if min(
-        args.deadline_ms,
         args.timeout_ms,
         args.estimated_rtt_ms,
         args.max_attempts,
         args.window_size,
     ) <= 0:
         parser.error("Timing, retry, and window settings must be positive")
-    if not 1 <= args.port <= 65535:
-        parser.error("Port must be between 1 and 65535")
 
     try:
-        if args.file:
+        if args.batch:
+            items = load_batch(args.batch)
+        elif args.file:
             file_path = Path(args.file)
-            data = encode_file(file_path.name, file_path.read_bytes())
-            print(f"[SENDER  ] sending file {file_path.name!r}")
+            items = [
+                make_item(
+                    encode_file(file_path.name, file_path.read_bytes()),
+                    f"file {file_path.name!r}",
+                    args.mode,
+                    args.deadline_ms,
+                    args.priority,
+                )
+            ]
         else:
-            data = encode_text(args.message)
+            items = [
+                make_item(
+                    encode_text(args.message),
+                    f"text {args.message!r}",
+                    args.mode,
+                    args.deadline_ms,
+                    args.priority,
+                )
+            ]
+
+        scheduler = DeadlineScheduler()
+        for item in items:
+            scheduler.add(
+                item,
+                item["reliability"],
+                item["deadline_at_ms"],
+                item["priority"],
+            )
 
         destination = (socket.gethostbyname(args.host), args.port)
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            return send_message(
+            client = DartClient(
                 sock,
                 destination,
-                data,
-                args.mode,
-                args.deadline_ms,
-                args.timeout_ms,
-                args.estimated_rtt_ms,
-                args.max_attempts,
-                args.window_size,
+                maximum_window=args.window_size,
+                timeout_ms=args.timeout_ms,
+                estimated_rtt_ms=args.estimated_rtt_ms,
+                max_attempts=args.max_attempts,
             )
-    except (OSError, PacketError) as error:
+            client.connect()
+
+            failed = False
+            while len(scheduler):
+                now_ms = int(time.monotonic() * 1000)
+                for expired in scheduler.expire(now_ms):
+                    print(f"[SENDER  ] expired in queue: {expired.data['label']}")
+
+                scheduled = scheduler.pop_next(now_ms)
+                if scheduled is None:
+                    break
+                item = scheduled.data
+                print(f"[SENDER  ] sending {item['label']}")
+                result = client.send(
+                    item["data"],
+                    item["reliability"],
+                    item["deadline_ms"],
+                    item["priority"],
+                    item["created_at_ms"],
+                    item["deadline_at_ms"],
+                )
+                print(f"[SENDER  ] {item['label']}: {result}")
+                failed = failed or result == "failed"
+                if failed:
+                    break
+
+            client.close()
+            return 1 if failed else 0
+    except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
         print(f"[SENDER  ] ERROR: {error}")
         return 1
 

@@ -8,18 +8,18 @@ The current project is a runnable minimum transport: it can send text and files
 between two devices using DART's own packet format, fragmentation, ACKs,
 retransmission, sliding window, RTT estimation, and basic congestion control.
 
-The runnable sender and receiver now use the DART v2 binary packet format. A
+The runnable sender and receiver now use the DART v3 binary packet format. A
 message is split into UDP-sized fragments, each fragment is acknowledged and
 retried when required, and the receiver reassembles the original message before
 delivering it.
 
-This is still a deliberately simple prototype, but it can keep several packets
-in flight and adjusts that number after ACKs and packet loss. DART does not yet
-provide production-grade congestion control, flow control, security, handshakes,
-or deadline queue scheduling.
+This is still a deliberately simple prototype, but it now includes connection
+handshakes, deadline scheduling, receiver expiration, receiver-advertised flow
+limits, packet pacing, and reproducible network impairment controls. It does not
+provide production-grade security or congestion fairness.
 
-The proposed v2 protocol and its delivery semantics are specified in
-[`docs/protocol-v2.md`](docs/protocol-v2.md). Features described there may still
+The proposed v3 protocol and its delivery semantics are specified in
+[`docs/protocol-v3.md`](docs/protocol-v3.md). Features described there may still
 be future targets unless the README says they are implemented.
 
 ## Run the Demo
@@ -38,6 +38,28 @@ python sender.py "hello" --mode partial --deadline-ms 1500
 
 The available modes are `unreliable`, `partial`, and `reliable`. Run either
 script with `--help` to see its simulation and timing options.
+
+## Send A Scheduled Batch
+
+`examples/batch.json` contains reliable and partial messages with different
+deadlines and priorities:
+
+```bash
+python sender.py --batch examples/batch.json
+```
+
+The sender uses earliest-deadline-first ordering. Messages that expire while
+waiting are abandoned. A batch entry has either `text` or `file`, plus `mode`,
+`priority`, and `deadline_ms` for partial messages.
+
+```json
+{
+  "text": "urgent update",
+  "mode": "partial",
+  "deadline_ms": 300,
+  "priority": 10
+}
+```
 
 ## Send A File
 
@@ -92,7 +114,7 @@ the text only after every fragment has arrived.
 
 - Binary `DATA` and `ACK` packets.
 - 64-bit connection and packet numbers.
-- Messages split into payloads of at most 1146 bytes.
+- Messages split into payloads of at most 1138 bytes.
 - Out-of-order reassembly and duplicate suppression.
 - A sliding window with a configurable maximum size.
 - Minimal AIMD congestion control: additive growth after ACKs and window halving
@@ -106,15 +128,20 @@ the text only after every fragment has arrived.
   remaining fragments.
 - Simulated data loss, ACK loss, delay, and first-send loss.
 - Text and binary file transfer applications.
+- `HELLO`, `HELLO_ACK`, and `CLOSE` connection state machine.
+- Earliest-deadline-first scheduling for JSON message batches.
+- Receiver-side expiration of stale partial messages.
+- Receiver-advertised maximum in-flight window.
+- RTT-based packet pacing.
+- Seeded loss, ACK loss, delay, jitter, and first-send-loss simulation.
 
 ## Not Implemented Yet
 
-- Handshake and connection state machine.
-- Receiver-side deadline expiration.
-- Deadline-aware queue scheduling.
-- Receiver-advertised flow control.
-- Packet pacing or production-grade congestion fairness.
 - Encryption or authentication.
+- Dynamic flow-window updates after the handshake.
+- Production-grade congestion control and fairness.
+- Clock-offset negotiation; physical devices should synchronize their clocks
+  for accurate receiver-side deadline decisions.
 
 This is an educational prototype. Do not expose it directly to the public
 internet because packets and transferred files are not encrypted or
@@ -124,4 +151,10 @@ authenticated.
 
 ```bash
 python -m unittest discover -s tests -v
+```
+
+Network impairment example:
+
+```bash
+python receiver.py --loss 0.05 --ack-loss 0.02 --delay-ms 40 --jitter-ms 10 --seed 7
 ```

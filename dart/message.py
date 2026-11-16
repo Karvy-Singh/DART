@@ -1,6 +1,7 @@
-"""Simple message fragmentation and reassembly for DART v2."""
+"""Simple message fragmentation and reassembly for DART v3."""
 
 import math
+import time
 import uuid
 
 from .packet import DataPacket, MAX_PAYLOAD_BYTES, PacketError, Reliability
@@ -14,6 +15,7 @@ def fragment_message(
     deadline_ms=None,
     channel_id=0,
     priority=0,
+    created_at_ms=None,
 ):
     """Split one bytes message into a list of DATA packets."""
     if not isinstance(data, bytes):
@@ -24,6 +26,8 @@ def fragment_message(
         raise PacketError("Message needs too many fragments")
 
     message_id = uuid.uuid4()
+    if created_at_ms is None:
+        created_at_ms = int(time.time() * 1000)
     packets = []
 
     for fragment_index in range(fragment_count):
@@ -42,6 +46,7 @@ def fragment_message(
                 reliability=reliability,
                 priority=priority,
                 deadline_ms=deadline_ms,
+                created_at_ms=created_at_ms,
                 payload=payload,
             )
         )
@@ -75,6 +80,7 @@ class MessageReassembler:
                 "channel_id": packet.channel_id,
                 "reliability": packet.reliability,
                 "deadline_ms": packet.deadline_ms,
+                "created_at_ms": packet.created_at_ms,
                 "priority": packet.priority,
                 "fragments": {},
             }
@@ -85,6 +91,7 @@ class MessageReassembler:
             or packet.channel_id != message["channel_id"]
             or packet.reliability != message["reliability"]
             or packet.deadline_ms != message["deadline_ms"]
+            or packet.created_at_ms != message["created_at_ms"]
             or packet.priority != message["priority"]
         ):
             raise PacketError("Fragments for one message have different metadata")
@@ -102,3 +109,24 @@ class MessageReassembler:
         del self.incomplete[message_key]
         self.completed.add(message_key)
         return complete_data
+
+    def expire(self, now_ms):
+        """Discard incomplete partial messages whose deadline has passed."""
+        expired = []
+        for key, message in list(self.incomplete.items()):
+            deadline_ms = message["deadline_ms"]
+            if deadline_ms is None:
+                continue
+            if message["created_at_ms"] + deadline_ms <= now_ms:
+                expired.append(key)
+                del self.incomplete[key]
+        return expired
+
+    def remove_connection(self, connection_id):
+        """Remove reassembly and duplicate state when a connection closes."""
+        self.incomplete = {
+            key: message
+            for key, message in self.incomplete.items()
+            if key[0] != connection_id
+        }
+        self.completed = {key for key in self.completed if key[0] != connection_id}

@@ -1,13 +1,13 @@
-# DART Protocol Version 2 (Draft)
+# DART Protocol Version 3 (Draft)
 
 ## Status
 
-This document defines the target behavior for DART v2. The repository currently
-implements binary `DATA` and `ACK` packets, message fragmentation and reassembly,
-a sliding window with selective ACKs, measured RTT with an adaptive timeout, and
-minimal AIMD congestion-window adjustment. The connection, scheduling,
-flow-control, pacing, and production-grade congestion-control sections remain
-targets for later milestones.
+This document defines the target behavior for DART v3. The repository currently
+implements the five packet types, connection state machine, fragmentation and
+reassembly, selective ACKs, adaptive timeouts, EDF message scheduling,
+receiver-side expiration, a receiver-advertised flow limit, packet pacing, and
+minimal AIMD congestion-window adjustment. Dynamic flow updates and
+production-grade congestion control remain future work.
 
 ## Purpose
 
@@ -44,7 +44,7 @@ produce confirmed `DELIVERED` outcomes.
 
 Messages are independent and unordered by default. Loss of one message must not
 prevent a complete unrelated message from being delivered. Ordered channels are
-outside the initial v2 scope.
+outside the initial v3 scope.
 
 ## Reliability Classes
 
@@ -107,7 +107,7 @@ CLOSED -> HANDSHAKING -> ESTABLISHED -> DRAINING -> CLOSED
 
 A handshake establishes a connection ID, protocol version, maximum datagram
 size, and initial packet numbers. Security, identity authentication, path
-migration, and zero-RTT establishment are not part of the initial v2 scope.
+migration, and zero-RTT establishment are not part of the initial v3 scope.
 
 ## Packet Types
 
@@ -123,7 +123,7 @@ CLOSE      Closes a connection and communicates a reason code.
 
 ## Common Header
 
-Every v2 packet carries:
+Every v3 packet carries:
 
 ```text
 version
@@ -143,6 +143,7 @@ fragment_count
 reliability
 priority
 deadline metadata (PARTIAL only)
+creation timestamp
 payload_length
 payload
 ```
@@ -163,7 +164,7 @@ The implemented `DATA` and `ACK` codec uses network byte order and the following
 | Connection ID | 8 bytes |
 | Packet number | 8 bytes |
 
-The implemented `DATA` header adds 30 bytes:
+The implemented `DATA` header adds 38 bytes:
 
 | Field | Width |
 | --- | ---: |
@@ -174,6 +175,7 @@ The implemented `DATA` header adds 30 bytes:
 | Reliability | 1 byte |
 | Priority | 1 byte |
 | Deadline in milliseconds | 4 bytes |
+| Creation time in Unix milliseconds | 8 bytes |
 | Payload length | 2 bytes |
 
 A zero deadline means no deadline and is valid only for `UNRELIABLE` and
@@ -184,13 +186,13 @@ number followed by an 8-byte bitmap. The largest packet is acknowledged
 implicitly. Bitmap bit zero represents `largest - 1`, bit one represents
 `largest - 2`, and so on through the 64 immediate predecessors.
 
-Packet type values 3 and 4 currently represent `DATA` and `ACK`. `HELLO`,
-`HELLO_ACK`, and `CLOSE` encodings remain to be defined with the connection
-state machine.
+Packet type values 1 through 5 represent `HELLO`, `HELLO_ACK`, `DATA`, `ACK`,
+and `CLOSE`. Handshake packets carry a 2-byte receive window. A `CLOSE` packet
+has no body.
 
 Encoded datagrams must not exceed 1200 bytes unless a later path-MTU mechanism
-negotiates a different limit. With the current 54-byte `DATA` headers, one
-packet can carry at most 1146 payload bytes.
+negotiates a different limit. With the current 62-byte `DATA` headers, one
+packet can carry at most 1138 payload bytes.
 
 ## Fragmentation And Delivery
 
@@ -204,18 +206,12 @@ packet can carry at most 1146 payload bytes.
 
 ## Scheduling
 
-The first v2 implementation will support these policies:
-
-```text
-FIFO
-Earliest Deadline First (EDF)
-Deadline-Aware EDF
-```
-
-Deadline-Aware EDF removes infeasible partial messages before selecting the
-feasible message with the earliest deadline. Reliable traffic must receive a
-minimum scheduling share so that partial traffic cannot starve connection
-control or reliable messages.
+The current sender accepts multiple messages through a JSON batch. It removes
+expired messages, selects partial messages by earliest deadline, then uses
+priority and insertion order as tie breakers. Messages without deadlines follow
+the deadline-bearing messages and are ordered by priority. Scheduling is
+non-preemptive: once transmission of a message starts, it finishes or expires
+before the scheduler selects another message.
 
 ## Congestion And Flow Control
 
@@ -224,10 +220,13 @@ window of successful acknowledgements it increases the window by one. A timeout
 halves the window, with a minimum of one packet. The `--window-size` setting is
 the maximum congestion window.
 
+The handshake advertises the receiver's maximum accepted in-flight window, and
+the sender limits its congestion window to that value. Packets are paced using
+the current RTT divided by the active congestion window.
+
 The following pieces remain future work:
 
-- Receiver-advertised flow-control capacity.
-- Packet pacing.
+- Dynamic receive-window updates after the handshake.
 - More accurate congestion detection and recovery.
 - Fairness evaluation against established transports.
 

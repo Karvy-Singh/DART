@@ -1,4 +1,4 @@
-"""Simple binary packet format for DART v2.
+"""Simple binary packet format for DART v3.
 
 This module only knows how to turn packet objects into bytes and back again.
 Networking, retries, and scheduling will be added in separate modules later.
@@ -11,7 +11,7 @@ import uuid
 
 
 MAGIC = b"DART"
-VERSION = 2
+VERSION = 3
 MAX_DATAGRAM_BYTES = 1200
 
 # All numbers use network byte order (the ! at the start).
@@ -19,11 +19,14 @@ MAX_DATAGRAM_BYTES = 1200
 COMMON_HEADER = struct.Struct("!4sBBHQQ")
 
 # DATA: message ID, channel, fragment index, fragment count, reliability,
-# priority, deadline, payload length.
-DATA_HEADER = struct.Struct("!16sHHHBBIH")
+# priority, deadline, creation time, payload length.
+DATA_HEADER = struct.Struct("!16sHHHBBIQH")
 
 # ACK: largest received packet and a bitmap for the previous 64 packets.
 ACK_HEADER = struct.Struct("!QQ")
+
+# HELLO and HELLO_ACK: the number of packets the sender can receive.
+HANDSHAKE_HEADER = struct.Struct("!H")
 
 DATA_HEADER_BYTES = COMMON_HEADER.size + DATA_HEADER.size
 ACK_PACKET_BYTES = COMMON_HEADER.size + ACK_HEADER.size
@@ -35,14 +38,33 @@ class PacketError(ValueError):
 
 
 class PacketType(IntEnum):
+    HELLO = 1
+    HELLO_ACK = 2
     DATA = 3
     ACK = 4
+    CLOSE = 5
 
 
 class Reliability(IntEnum):
     UNRELIABLE = 0
     PARTIAL = 1
     RELIABLE = 2
+
+
+@dataclass(frozen=True)
+class HelloPacket:
+    connection_id: int
+    packet_number: int
+    receive_window: int
+    flags: int = 0
+
+
+@dataclass(frozen=True)
+class HelloAckPacket:
+    connection_id: int
+    packet_number: int
+    receive_window: int
+    flags: int = 0
 
 
 @dataclass(frozen=True)
@@ -56,6 +78,7 @@ class DataPacket:
     reliability: Reliability
     priority: int
     deadline_ms: int | None
+    created_at_ms: int
     payload: bytes
     flags: int = 0
 
@@ -83,15 +106,23 @@ class AckPacket:
         return bool(self.ack_bitmap & (1 << bit))
 
 
+@dataclass(frozen=True)
+class ClosePacket:
+    connection_id: int
+    packet_number: int
+    flags: int = 0
+
+
 def valid_number(value, bits):
     """Return True when value fits in an unsigned integer of this size."""
     return type(value) is int and 0 <= value < (1 << bits)
 
 
 def encode_packet(packet):
-    """Convert a DataPacket or AckPacket into bytes for socket.sendto()."""
-    if not isinstance(packet, (DataPacket, AckPacket)):
-        raise PacketError("Expected a DataPacket or AckPacket")
+    """Convert a packet object into bytes for socket.sendto()."""
+    packet_classes = (HelloPacket, HelloAckPacket, DataPacket, AckPacket, ClosePacket)
+    if not isinstance(packet, packet_classes):
+        raise PacketError("Expected a DART packet")
 
     if not valid_number(packet.connection_id, 64) or packet.connection_id == 0:
         raise PacketError("Connection ID must be a non-zero 64-bit number")
@@ -99,6 +130,25 @@ def encode_packet(packet):
         raise PacketError("Packet number must be a 64-bit number")
     if not valid_number(packet.flags, 16):
         raise PacketError("Flags must be a 16-bit number")
+
+    if isinstance(packet, (HelloPacket, HelloAckPacket)):
+        if not valid_number(packet.receive_window, 16) or packet.receive_window == 0:
+            raise PacketError("Receive window must be between 1 and 65535")
+
+        if isinstance(packet, HelloPacket):
+            packet_type = PacketType.HELLO
+        else:
+            packet_type = PacketType.HELLO_ACK
+
+        common_bytes = COMMON_HEADER.pack(
+            MAGIC,
+            VERSION,
+            packet_type,
+            packet.flags,
+            packet.connection_id,
+            packet.packet_number,
+        )
+        return common_bytes + HANDSHAKE_HEADER.pack(packet.receive_window)
 
     if isinstance(packet, DataPacket):
         packet_type = PacketType.DATA
@@ -121,8 +171,12 @@ def encode_packet(packet):
         if packet.reliability == Reliability.PARTIAL:
             if not valid_number(packet.deadline_ms, 32) or packet.deadline_ms == 0:
                 raise PacketError("PARTIAL packets require a positive deadline")
+            if not valid_number(packet.created_at_ms, 64) or packet.created_at_ms == 0:
+                raise PacketError("PARTIAL packets require a creation time")
         elif packet.deadline_ms is not None:
             raise PacketError("Only PARTIAL packets may carry a deadline")
+        elif not valid_number(packet.created_at_ms, 64):
+            raise PacketError("Creation time must be a 64-bit number")
 
         if not isinstance(packet.payload, bytes):
             raise PacketError("Payload must be bytes")
@@ -145,26 +199,37 @@ def encode_packet(packet):
             packet.reliability,
             packet.priority,
             packet.deadline_ms or 0,
+            packet.created_at_ms,
             len(packet.payload),
         )
         return common_bytes + data_bytes + packet.payload
 
-    packet_type = PacketType.ACK
-    if not valid_number(packet.largest_acknowledged, 64):
-        raise PacketError("Largest acknowledged must be a 64-bit number")
-    if not valid_number(packet.ack_bitmap, 64):
-        raise PacketError("ACK bitmap must be a 64-bit number")
+    if isinstance(packet, AckPacket):
+        if not valid_number(packet.largest_acknowledged, 64):
+            raise PacketError("Largest acknowledged must be a 64-bit number")
+        if not valid_number(packet.ack_bitmap, 64):
+            raise PacketError("ACK bitmap must be a 64-bit number")
+
+        common_bytes = COMMON_HEADER.pack(
+            MAGIC,
+            VERSION,
+            PacketType.ACK,
+            packet.flags,
+            packet.connection_id,
+            packet.packet_number,
+        )
+        ack_bytes = ACK_HEADER.pack(packet.largest_acknowledged, packet.ack_bitmap)
+        return common_bytes + ack_bytes
 
     common_bytes = COMMON_HEADER.pack(
         MAGIC,
         VERSION,
-        packet_type,
+        PacketType.CLOSE,
         packet.flags,
         packet.connection_id,
         packet.packet_number,
     )
-    ack_bytes = ACK_HEADER.pack(packet.largest_acknowledged, packet.ack_bitmap)
-    return common_bytes + ack_bytes
+    return common_bytes
 
 
 def decode_packet(raw):
@@ -189,6 +254,22 @@ def decode_packet(raw):
 
     body = raw[COMMON_HEADER.size:]
 
+    if packet_type in (PacketType.HELLO, PacketType.HELLO_ACK):
+        if len(body) != HANDSHAKE_HEADER.size:
+            raise PacketError("Handshake packet has an invalid length")
+
+        (receive_window,) = HANDSHAKE_HEADER.unpack(body)
+        if receive_window == 0:
+            raise PacketError("Receive window must be between 1 and 65535")
+
+        packet_class = HelloPacket if packet_type == PacketType.HELLO else HelloAckPacket
+        return packet_class(
+            connection_id=connection_id,
+            packet_number=packet_number,
+            receive_window=receive_window,
+            flags=flags,
+        )
+
     if packet_type == PacketType.DATA:
         if len(body) < DATA_HEADER.size:
             raise PacketError("DATA packet is too short")
@@ -201,7 +282,8 @@ def decode_packet(raw):
         reliability_number = values[4]
         priority = values[5]
         deadline_number = values[6]
-        payload_length = values[7]
+        created_at_ms = values[7]
+        payload_length = values[8]
         payload = body[DATA_HEADER.size:]
 
         if len(payload) != payload_length:
@@ -217,6 +299,8 @@ def decode_packet(raw):
         deadline_ms = deadline_number or None
         if reliability == Reliability.PARTIAL and deadline_ms is None:
             raise PacketError("PARTIAL packets require a positive deadline")
+        if reliability == Reliability.PARTIAL and created_at_ms == 0:
+            raise PacketError("PARTIAL packets require a creation time")
         if reliability != Reliability.PARTIAL and deadline_ms is not None:
             raise PacketError("Only PARTIAL packets may carry a deadline")
 
@@ -230,6 +314,7 @@ def decode_packet(raw):
             reliability=reliability,
             priority=priority,
             deadline_ms=deadline_ms,
+            created_at_ms=created_at_ms,
             payload=payload,
             flags=flags,
         )
@@ -244,6 +329,15 @@ def decode_packet(raw):
             packet_number=packet_number,
             largest_acknowledged=largest_acknowledged,
             ack_bitmap=ack_bitmap,
+            flags=flags,
+        )
+
+    if packet_type == PacketType.CLOSE:
+        if body:
+            raise PacketError("CLOSE packet has an invalid length")
+        return ClosePacket(
+            connection_id=connection_id,
+            packet_number=packet_number,
             flags=flags,
         )
 

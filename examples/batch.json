@@ -1,0 +1,19 @@
+[
+  {
+    "text": "reliable metadata",
+    "mode": "reliable",
+    "priority": 5
+  },
+  {
+    "text": "frame with a later deadline",
+    "mode": "partial",
+    "deadline_ms": 5000,
+    "priority": 1
+  },
+  {
+    "text": "urgent frame",
+    "mode": "partial",
+    "deadline_ms": 3000,
+    "priority": 10
+  }
+]
