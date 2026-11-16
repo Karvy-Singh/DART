@@ -4,9 +4,9 @@
 
 This document defines the target behavior for DART v2. The repository currently
 implements binary `DATA` and `ACK` packets, message fragmentation and reassembly,
-simple stop-and-wait retransmission, and measured RTT with an adaptive timeout.
-The connection, scheduling, and congestion-control sections remain targets for
-later milestones.
+a fixed sliding window with selective ACKs, and measured RTT with an adaptive
+timeout. The connection, scheduling, flow-control, and congestion-control
+sections remain targets for later milestones.
 
 ## Purpose
 

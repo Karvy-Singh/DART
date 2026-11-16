@@ -7,6 +7,7 @@ import time
 
 from dart import (
     MAX_DATAGRAM_BYTES,
+    AckTracker,
     AckPacket,
     DataPacket,
     MessageReassembler,
@@ -43,6 +44,7 @@ def main():
     reassembler = MessageReassembler()
     dropped_once = set()
     next_ack_number = {}
+    ack_trackers = {}
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind((args.host, args.port))
@@ -108,6 +110,9 @@ def main():
 
                 if packet.reliability == Reliability.UNRELIABLE:
                     continue
+
+                tracker = ack_trackers.setdefault(packet.connection_id, AckTracker())
+                largest, bitmap = tracker.add(packet.packet_number)
                 if random_generator.random() < args.ack_loss:
                     print("[NETWORK ] ACK lost", flush=True)
                     continue
@@ -117,7 +122,8 @@ def main():
                 ack = AckPacket(
                     connection_id=packet.connection_id,
                     packet_number=ack_number,
-                    largest_acknowledged=packet.packet_number,
+                    largest_acknowledged=largest,
+                    ack_bitmap=bitmap,
                 )
                 sock.sendto(encode_packet(ack), address)
                 print(

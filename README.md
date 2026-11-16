@@ -9,9 +9,10 @@ message is split into UDP-sized fragments, each fragment is acknowledged and
 retried when required, and the receiver reassembles the original message before
 delivering it.
 
-This is still a deliberately simple stop-and-wait milestone. DART does not yet
-provide TCP- or QUIC-level congestion control, flow control, security,
-handshakes, scheduling, or multiple packets in flight.
+This is still a deliberately simple prototype, but it can keep several packets
+in flight using a fixed sliding window. DART does not yet provide TCP- or
+QUIC-level congestion control, flow control, security, handshakes, or deadline
+queue scheduling.
 
 The proposed v2 protocol and its delivery semantics are specified in
 [`docs/protocol-v2.md`](docs/protocol-v2.md). Features described there may still
@@ -43,7 +44,7 @@ python receiver.py --drop-first
 Then send a message larger than one packet:
 
 ```bash
-python sender.py "A long message..." --mode reliable
+python sender.py "A long message..." --mode reliable --window-size 4
 ```
 
 The sender reports the number of fragments and retries. The receiver delivers
@@ -55,7 +56,9 @@ the text only after every fragment has arrived.
 - 64-bit connection and packet numbers.
 - Messages split into payloads of at most 1146 bytes.
 - Out-of-order reassembly and duplicate suppression.
-- Per-fragment ACKs and stop-and-wait retransmission.
+- A configurable fixed sliding window with multiple packets in flight.
+- Selective ACK bitmaps that can acknowledge up to 65 packet numbers.
+- Per-fragment timeout and retransmission.
 - Measured RTT and an automatically adjusted retransmission timeout.
 - Timeout backoff after packet loss.
 - Unreliable, partial, and reliable sending modes.
@@ -66,10 +69,10 @@ the text only after every fragment has arrived.
 ## Not Implemented Yet
 
 - Handshake and connection state machine.
-- Sliding send window or multiple packets in flight.
 - Receiver-side deadline expiration.
 - Deadline-aware queue scheduling.
-- Flow control, congestion control, encryption, or authentication.
+- Receiver-advertised flow control.
+- Congestion control, encryption, or authentication.
 
 ## Run Tests
 

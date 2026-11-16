@@ -1,6 +1,7 @@
 """Simple DART v2 sender. Start receiver.py before running this file."""
 
 import argparse
+import math
 import socket
 import time
 import uuid
@@ -33,12 +34,11 @@ def send_message(
     timeout_ms,
     estimated_rtt_ms,
     max_attempts,
+    window_size,
 ):
-    """Send one text message, one fragment at a time."""
-    connection_id = uuid.uuid4().int & ((1 << 64) - 1)
-    connection_id = connection_id or 1
+    """Send one text message with a small fixed sliding window."""
+    connection_id = uuid.uuid4().int & ((1 << 64) - 1) or 1
     reliability = MODE_NAMES[mode]
-
     packets = fragment_message(
         message.encode("utf-8"),
         connection_id=connection_id,
@@ -49,107 +49,136 @@ def send_message(
 
     started = time.monotonic()
     expires_at = started + deadline_ms / 1000 if mode == "partial" else None
-    total_attempts = 0
     rtt = RttEstimator(estimated_rtt_ms, timeout_ms)
+    total_attempts = 0
 
     print(
         f"[SENDER  ] connection={connection_id}, mode={mode}, "
-        f"fragments={len(packets)}",
+        f"fragments={len(packets)}, window={window_size}",
         flush=True,
     )
 
-    for packet in packets:
-        raw = encode_packet(packet)
-        fragment_number = packet.fragment_index + 1
-
-        if mode == "unreliable":
-            sock.sendto(raw, destination)
-            total_attempts += 1
+    # Unreliable packets are sent once and do not need a window or ACKs.
+    if mode == "unreliable":
+        for packet in packets:
+            sock.sendto(encode_packet(packet), destination)
             print(
-                f"[SENDER  ] sent fragment {fragment_number}/{len(packets)} once",
+                f"[SENDER  ] sent fragment "
+                f"{packet.fragment_index + 1}/{len(packets)} once",
                 flush=True,
             )
-            continue
+        print("[SENDER  ] finished: delivery is not confirmed")
+        return 0
 
-        fragment_delivered = False
+    next_packet = 0
+    delivered_count = 0
+    in_flight = {}
 
-        for attempt in range(1, max_attempts + 1):
-            if expires_at is not None:
-                remaining_ms = (expires_at - time.monotonic()) * 1000
-                fragments_left = len(packets) - packet.fragment_index
-                estimated_delivery_ms = rtt.rtt_ms * fragments_left
-                if remaining_ms < estimated_delivery_ms:
-                    print("[SENDER  ] ABANDON: not enough time before deadline")
-                    return 2
+    while delivered_count < len(packets):
+        if expires_at is not None:
+            remaining_ms = (expires_at - time.monotonic()) * 1000
+            packets_left = len(packets) - delivered_count
+            rounds_left = math.ceil(packets_left / window_size)
+            if remaining_ms < rtt.rtt_ms * rounds_left:
+                print("[SENDER  ] ABANDON: not enough time before deadline")
+                return 2
 
-            sent_at = time.monotonic()
+        # Fill all free places in the window.
+        while next_packet < len(packets) and len(in_flight) < window_size:
+            packet = packets[next_packet]
+            raw = encode_packet(packet)
             sock.sendto(raw, destination)
+            in_flight[packet.packet_number] = {
+                "packet": packet,
+                "raw": raw,
+                "attempts": 1,
+                "sent_at": time.monotonic(),
+            }
             total_attempts += 1
+            next_packet += 1
             print(
-                f"[SENDER  ] sent fragment {fragment_number}/{len(packets)}, "
-                f"attempt {attempt}",
+                f"[SENDER  ] sent fragment "
+                f"{packet.fragment_index + 1}/{len(packets)}",
                 flush=True,
             )
 
-            wait_seconds = rtt.timeout_ms / 1000
-            if expires_at is not None:
-                wait_seconds = min(
-                    wait_seconds,
-                    max(0, expires_at - time.monotonic()),
-                )
-            wait_until = time.monotonic() + wait_seconds
+        # Wait for an ACK, but never wait past the next packet timeout.
+        now = time.monotonic()
+        next_timeout = min(
+            state["sent_at"] + rtt.timeout_ms / 1000
+            for state in in_flight.values()
+        )
+        wait_seconds = max(0.001, next_timeout - now)
+        if expires_at is not None:
+            wait_seconds = min(wait_seconds, max(0.001, expires_at - now))
+        sock.settimeout(wait_seconds)
 
-            while time.monotonic() < wait_until:
-                sock.settimeout(max(0.001, wait_until - time.monotonic()))
-                try:
-                    raw_ack, peer = sock.recvfrom(MAX_DATAGRAM_BYTES + 1)
-                except socket.timeout:
-                    break
+        try:
+            raw_ack, peer = sock.recvfrom(MAX_DATAGRAM_BYTES + 1)
+        except socket.timeout:
+            raw_ack = None
+            peer = None
 
-                if peer != destination:
-                    continue
+        if raw_ack is not None and peer == destination:
+            try:
+                ack = decode_packet(raw_ack)
+            except PacketError:
+                ack = None
 
-                try:
-                    ack = decode_packet(raw_ack)
-                except PacketError:
-                    continue
+            if isinstance(ack, AckPacket) and ack.connection_id == connection_id:
+                acknowledged = [
+                    number for number in in_flight if ack.acknowledges(number)
+                ]
 
-                if (
-                    isinstance(ack, AckPacket)
-                    and ack.connection_id == connection_id
-                    and ack.acknowledges(packet.packet_number)
-                ):
-                    fragment_delivered = True
-                    break
+                for number in acknowledged:
+                    state = in_flight.pop(number)
+                    if state["attempts"] == 1:
+                        measured_ms = (
+                            time.monotonic() - state["sent_at"]
+                        ) * 1000
+                        rtt.add_measurement(measured_ms)
+                    delivered_count += 1
 
-            if fragment_delivered:
-                # A retransmitted packet gives an ambiguous RTT measurement.
-                if attempt == 1:
-                    measured_rtt_ms = (time.monotonic() - sent_at) * 1000
-                    rtt.add_measurement(measured_rtt_ms)
-                print(
-                    f"[SENDER  ] ACK for fragment "
-                    f"{fragment_number}/{len(packets)} "
-                    f"(RTT={rtt.rtt_ms:.0f}ms, timeout={rtt.timeout_ms:.0f}ms)",
-                    flush=True,
-                )
-                break
+                if acknowledged:
+                    print(
+                        f"[SENDER  ] ACK covered {len(acknowledged)} packet(s) "
+                        f"(RTT={rtt.rtt_ms:.0f}ms, "
+                        f"timeout={rtt.timeout_ms:.0f}ms)",
+                        flush=True,
+                    )
+
+        # Retry packets that have waited longer than the current timeout.
+        now = time.monotonic()
+        timed_out = [
+            state
+            for state in in_flight.values()
+            if now - state["sent_at"] >= rtt.timeout_ms / 1000
+        ]
+        if timed_out:
+            for state in timed_out:
+                if state["attempts"] >= max_attempts:
+                    fragment = state["packet"].fragment_index + 1
+                    print(f"[SENDER  ] FAILED on fragment {fragment}")
+                    return 1
 
             rtt.packet_timed_out()
-            print("[SENDER  ] no ACK, retrying", flush=True)
-
-        if not fragment_delivered:
-            print(f"[SENDER  ] FAILED on fragment {fragment_number}")
-            return 1
+            for state in timed_out:
+                state["attempts"] += 1
+                state["sent_at"] = time.monotonic()
+                sock.sendto(state["raw"], destination)
+                total_attempts += 1
+                print(
+                    f"[SENDER  ] retry fragment "
+                    f"{state['packet'].fragment_index + 1}, "
+                    f"attempt {state['attempts']}",
+                    flush=True,
+                )
 
     elapsed_ms = (time.monotonic() - started) * 1000
-    if mode == "unreliable":
-        print("[SENDER  ] finished: delivery is not confirmed")
-    else:
-        print(
-            f"[SENDER  ] complete after {total_attempts} transmission(s), "
-            f"{elapsed_ms:.0f}ms",
-        )
+    print(
+        f"[SENDER  ] complete after {total_attempts} transmission(s), "
+        f"{elapsed_ms:.0f}ms",
+    )
     return 0
 
 
@@ -173,6 +202,12 @@ def main():
         help="Initial RTT guess used before the first measurement",
     )
     parser.add_argument("--max-attempts", type=int, default=10)
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=4,
+        help="Maximum number of unacknowledged fragments",
+    )
     args = parser.parse_args()
 
     if min(
@@ -180,8 +215,9 @@ def main():
         args.timeout_ms,
         args.estimated_rtt_ms,
         args.max_attempts,
+        args.window_size,
     ) <= 0:
-        parser.error("Timing and retry settings must be positive")
+        parser.error("Timing, retry, and window settings must be positive")
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535")
 
@@ -197,6 +233,7 @@ def main():
                 args.timeout_ms,
                 args.estimated_rtt_ms,
                 args.max_attempts,
+                args.window_size,
             )
     except (OSError, PacketError) as error:
         print(f"[SENDER  ] ERROR: {error}")
