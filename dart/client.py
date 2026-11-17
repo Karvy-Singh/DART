@@ -1,6 +1,7 @@
 """Small reusable DART client used by the command-line sender."""
 
 import math
+import secrets
 import socket
 import time
 import uuid
@@ -11,6 +12,7 @@ from .message import fragment_message
 from .pacing import Pacer
 from .packet import (
     MAX_DATAGRAM_BYTES,
+    MAX_PAYLOAD_BYTES,
     AckPacket,
     ClosePacket,
     HelloAckPacket,
@@ -21,6 +23,17 @@ from .packet import (
     encode_packet,
 )
 from .rtt import RttEstimator
+from .security import (
+    AEAD_TAG_BYTES,
+    SecurityError,
+    derive_session_key,
+    encrypt_data,
+    sign_close,
+    sign_hello,
+    verify_ack,
+    verify_close,
+    verify_hello_ack,
+)
 
 
 class DartClient:
@@ -28,6 +41,7 @@ class DartClient:
         self,
         sock,
         destination,
+        pre_shared_key,
         maximum_window=8,
         timeout_ms=250,
         estimated_rtt_ms=100,
@@ -36,6 +50,7 @@ class DartClient:
         connection_id = uuid.uuid4().int & ((1 << 64) - 1) or 1
         self.sock = sock
         self.destination = destination
+        self.pre_shared_key = pre_shared_key
         self.connection = Connection(connection_id)
         self.maximum_window = maximum_window
         self.max_attempts = max_attempts
@@ -44,14 +59,21 @@ class DartClient:
         self.pacer = Pacer()
         self.next_packet_number = 1
         self.failed = False
+        self.client_nonce = secrets.token_bytes(16)
+        self.session_key = None
+        self.latest_ack_number = -1
 
     def connect(self):
         """Exchange HELLO packets and learn the receiver's flow window."""
         self.connection.start_handshake()
-        hello = HelloPacket(
-            connection_id=self.connection.connection_id,
-            packet_number=0,
-            receive_window=self.maximum_window,
+        hello = sign_hello(
+            HelloPacket(
+                connection_id=self.connection.connection_id,
+                packet_number=0,
+                receive_window=self.maximum_window,
+                nonce=self.client_nonce,
+            ),
+            self.pre_shared_key,
         )
         raw = encode_packet(hello)
 
@@ -74,6 +96,16 @@ class DartClient:
                 isinstance(packet, HelloAckPacket)
                 and packet.connection_id == self.connection.connection_id
             ):
+                try:
+                    verify_hello_ack(packet, self.pre_shared_key, self.client_nonce)
+                except SecurityError:
+                    continue
+                self.session_key = derive_session_key(
+                    self.pre_shared_key,
+                    self.connection.connection_id,
+                    self.client_nonce,
+                    packet.nonce,
+                )
                 self.connection.establish(packet.receive_window)
                 print(
                     f"[SENDER  ] connected; receiver window={packet.receive_window}, "
@@ -116,12 +148,13 @@ class DartClient:
             deadline_ms=deadline_ms,
             priority=priority,
             created_at_ms=created_at_ms,
+            max_payload_bytes=MAX_PAYLOAD_BYTES - AEAD_TAG_BYTES,
         )
         self.next_packet_number += len(packets)
 
         if reliability == Reliability.UNRELIABLE:
             for packet in packets:
-                self._send_raw(encode_packet(packet))
+                self._send_raw(encode_packet(encrypt_data(packet, self.session_key)))
             return "unconfirmed"
 
         next_packet = 0
@@ -145,6 +178,7 @@ class DartClient:
 
             while next_packet < len(packets) and len(in_flight) < send_limit:
                 packet = packets[next_packet]
+                packet = encrypt_data(packet, self.session_key)
                 raw = encode_packet(packet)
                 sent_at = self._send_raw(raw)
                 in_flight[packet.packet_number] = {
@@ -181,6 +215,19 @@ class DartClient:
                     isinstance(ack, AckPacket)
                     and ack.connection_id == self.connection.connection_id
                 ):
+                    try:
+                        verify_ack(ack, self.session_key)
+                    except SecurityError:
+                        continue
+                    if ack.packet_number > self.latest_ack_number:
+                        self.latest_ack_number = ack.packet_number
+                        if ack.receive_window != self.connection.peer_window:
+                            print(
+                                f"[SENDER  ] receiver window updated to "
+                                f"{ack.receive_window}",
+                                flush=True,
+                            )
+                        self.connection.peer_window = ack.receive_window
                     acknowledged = [
                         number for number in in_flight if ack.acknowledges(number)
                     ]
@@ -217,9 +264,12 @@ class DartClient:
 
     def close(self):
         self.connection.start_close()
-        packet = ClosePacket(
-            connection_id=self.connection.connection_id,
-            packet_number=self.next_packet_number,
+        packet = sign_close(
+            ClosePacket(
+                connection_id=self.connection.connection_id,
+                packet_number=self.next_packet_number,
+            ),
+            self.session_key,
         )
         raw = encode_packet(packet)
         for _ in range(3):
@@ -239,6 +289,10 @@ class DartClient:
                 isinstance(response, ClosePacket)
                 and response.connection_id == self.connection.connection_id
             ):
+                try:
+                    verify_close(response, self.session_key, role=b"server")
+                except SecurityError:
+                    continue
                 break
         self.connection.finish_close()
 
@@ -270,6 +324,13 @@ class DartClient:
                 or ack.connection_id != self.connection.connection_id
             ):
                 continue
+            try:
+                verify_ack(ack, self.session_key)
+            except SecurityError:
+                continue
+            if ack.packet_number > self.latest_ack_number:
+                self.latest_ack_number = ack.packet_number
+                self.connection.peer_window = ack.receive_window
             for number in list(in_flight):
                 if ack.acknowledges(number):
                     del in_flight[number]

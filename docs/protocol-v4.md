@@ -1,13 +1,13 @@
-# DART Protocol Version 3 (Draft)
+# DART Protocol Version 4 (Draft)
 
 ## Status
 
-This document defines the target behavior for DART v3. The repository currently
+This document defines the target behavior for DART v4. The repository currently
 implements the five packet types, connection state machine, fragmentation and
 reassembly, selective ACKs, adaptive timeouts, EDF message scheduling,
-receiver-side expiration, a receiver-advertised flow limit, packet pacing, and
-minimal AIMD congestion-window adjustment. Dynamic flow updates and
-production-grade congestion control remain future work.
+receiver-side expiration, dynamic receiver-window updates, packet pacing,
+pre-shared-key authenticated encryption, and minimal AIMD congestion-window
+adjustment. Production-grade congestion control remains future work.
 
 ## Purpose
 
@@ -44,7 +44,7 @@ produce confirmed `DELIVERED` outcomes.
 
 Messages are independent and unordered by default. Loss of one message must not
 prevent a complete unrelated message from being delivered. Ordered channels are
-outside the initial v3 scope.
+outside the initial v4 scope.
 
 ## Reliability Classes
 
@@ -106,8 +106,8 @@ CLOSED -> HANDSHAKING -> ESTABLISHED -> DRAINING -> CLOSED
 ```
 
 A handshake establishes a connection ID, protocol version, maximum datagram
-size, and initial packet numbers. Security, identity authentication, path
-migration, and zero-RTT establishment are not part of the initial v3 scope.
+size, random nonces, and initial packet numbers. Path migration, forward secrecy,
+automatic key rotation, and zero-RTT establishment are not part of v4.
 
 ## Packet Types
 
@@ -123,7 +123,7 @@ CLOSE      Closes a connection and communicates a reason code.
 
 ## Common Header
 
-Every v3 packet carries:
+Every v4 packet carries:
 
 ```text
 version
@@ -182,17 +182,20 @@ A zero deadline means no deadline and is valid only for `UNRELIABLE` and
 `RELIABLE` packets. A `PARTIAL` packet requires a positive deadline.
 
 The implemented `ACK` body contains an 8-byte largest acknowledged packet
-number followed by an 8-byte bitmap. The largest packet is acknowledged
-implicitly. Bitmap bit zero represents `largest - 1`, bit one represents
-`largest - 2`, and so on through the 64 immediate predecessors.
+number, an 8-byte bitmap, a 2-byte available receive window, and a 32-byte HMAC.
+The largest packet is acknowledged implicitly. Bitmap bit zero represents
+`largest - 1`, bit one represents `largest - 2`, and so on through the 64
+immediate predecessors.
 
 Packet type values 1 through 5 represent `HELLO`, `HELLO_ACK`, `DATA`, `ACK`,
-and `CLOSE`. Handshake packets carry a 2-byte receive window. A `CLOSE` packet
-has no body.
+and `CLOSE`. Handshake packets carry a 2-byte receive window, a 16-byte random
+nonce, and a 32-byte HMAC. ACK packets carry a dynamic 2-byte receive window and
+a 32-byte HMAC. CLOSE packets carry a 32-byte HMAC.
 
 Encoded datagrams must not exceed 1200 bytes unless a later path-MTU mechanism
 negotiates a different limit. With the current 62-byte `DATA` headers, one
-packet can carry at most 1138 payload bytes.
+packet carries at most 1138 encrypted bytes or 1122 plaintext bytes after the
+ChaCha20-Poly1305 tag.
 
 ## Fragmentation And Delivery
 
@@ -220,15 +223,28 @@ window of successful acknowledgements it increases the window by one. A timeout
 halves the window, with a minimum of one packet. The `--window-size` setting is
 the maximum congestion window.
 
-The handshake advertises the receiver's maximum accepted in-flight window, and
-the sender limits its congestion window to that value. Packets are paced using
-the current RTT divided by the active congestion window.
+The handshake advertises the receiver's maximum accepted in-flight window. Each
+authenticated ACK updates the currently available window based on buffered
+messages. The receiver bounds concurrent incomplete messages, per-message bytes,
+and duplicate-history state. The sender immediately applies only the newest
+authenticated window update. Packets are paced
+using the current RTT divided by the active congestion window.
 
 The following pieces remain future work:
 
-- Dynamic receive-window updates after the handshake.
 - More accurate congestion detection and recovery.
 - Fairness evaluation against established transports.
+
+## Security
+
+Both endpoints are configured with the same 32-byte pre-shared key. HELLO and
+HELLO_ACK exchange random nonces authenticated with HMAC-SHA256. The connection
+ID and both nonces derive a unique 32-byte session key.
+
+DATA payloads use ChaCha20-Poly1305. Packet metadata is additional authenticated
+data, so changing a deadline, priority, message ID, fragment number, or packet
+number causes authentication failure. ACK and CLOSE packets use HMAC-SHA256 to
+prevent forged delivery acknowledgements, window updates, or teardown.
 
 Performance comparisons without these controls must not claim fairness against
 TCP or QUIC.
@@ -237,7 +253,7 @@ TCP or QUIC.
 
 - A compatible implementation of HTTP, TCP, or QUIC.
 - Transparent support for arbitrary byte-stream applications.
-- Encryption or endpoint authentication.
+- Forward secrecy or certificate-based identity.
 - NAT traversal or path migration.
 - Kernel integration.
 - Production deployment guarantees.

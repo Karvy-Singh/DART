@@ -1,26 +1,39 @@
-"""Build small selective acknowledgements for received packet numbers."""
+"""Build selective acknowledgements and remember received packet ranges."""
 
 
 class AckTracker:
     def __init__(self):
-        self.received = set()
+        self.ranges = []
 
     def add(self, packet_number):
         """Remember a packet and return the largest number plus ACK bitmap."""
-        if self.received and packet_number < max(self.received) - 64:
-            # An old retransmission no longer fits in the bitmap. ACK it alone.
+        self._remember(packet_number)
+        largest = self.ranges[-1][1]
+
+        # An old retransmission no longer fits in the bitmap. ACK it alone.
+        if packet_number < largest - 64:
             return packet_number, 0
 
-        self.received.add(packet_number)
-        largest = max(self.received)
         bitmap = 0
-
         for distance in range(1, 65):
-            if largest - distance in self.received:
+            if self.has_received(largest - distance):
                 bitmap |= 1 << (distance - 1)
-
-        # The packet format can only report the largest 65 packet numbers.
-        self.received = {
-            number for number in self.received if number >= largest - 64
-        }
         return largest, bitmap
+
+    def has_received(self, packet_number):
+        """Return True only when this exact packet was previously received."""
+        return any(start <= packet_number <= end for start, end in self.ranges)
+
+    def _remember(self, packet_number):
+        """Store packet numbers as merged ranges to keep long runs compact."""
+        self.ranges.append((packet_number, packet_number))
+        self.ranges.sort()
+
+        merged = []
+        for start, end in self.ranges:
+            if merged and start <= merged[-1][1] + 1:
+                old_start, old_end = merged[-1]
+                merged[-1] = (old_start, max(old_end, end))
+            else:
+                merged.append((start, end))
+        self.ranges = merged

@@ -1,4 +1,4 @@
-"""Simple message fragmentation and reassembly for DART v3."""
+"""Simple message fragmentation and reassembly for DART v4."""
 
 import math
 import time
@@ -16,12 +16,15 @@ def fragment_message(
     channel_id=0,
     priority=0,
     created_at_ms=None,
+    max_payload_bytes=MAX_PAYLOAD_BYTES,
 ):
     """Split one bytes message into a list of DATA packets."""
     if not isinstance(data, bytes):
         raise PacketError("Message data must be bytes")
 
-    fragment_count = max(1, math.ceil(len(data) / MAX_PAYLOAD_BYTES))
+    if not 1 <= max_payload_bytes <= MAX_PAYLOAD_BYTES:
+        raise PacketError("Invalid maximum fragment payload size")
+    fragment_count = max(1, math.ceil(len(data) / max_payload_bytes))
     if fragment_count > 65535:
         raise PacketError("Message needs too many fragments")
 
@@ -31,8 +34,8 @@ def fragment_message(
     packets = []
 
     for fragment_index in range(fragment_count):
-        start = fragment_index * MAX_PAYLOAD_BYTES
-        end = start + MAX_PAYLOAD_BYTES
+        start = fragment_index * max_payload_bytes
+        end = start + max_payload_bytes
         payload = data[start:end]
 
         packets.append(
@@ -57,11 +60,15 @@ def fragment_message(
 class MessageReassembler:
     """Collect DATA fragments and return complete messages."""
 
-    def __init__(self):
+    def __init__(self, max_completed=4096):
+        if max_completed <= 0:
+            raise ValueError("Completed-message limit must be positive")
         self.incomplete = {}
         self.completed = set()
+        self.completed_order = []
+        self.max_completed = max_completed
 
-    def add(self, packet):
+    def add(self, packet, now_ms=None):
         """Add one fragment and return bytes when its message is complete."""
         if not isinstance(packet, DataPacket):
             raise PacketError("Reassembler only accepts DATA packets")
@@ -71,6 +78,8 @@ class MessageReassembler:
             raise PacketError("Fragment numbers are invalid")
 
         message_key = (packet.connection_id, packet.message_id)
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
         if message_key in self.completed:
             return None
 
@@ -83,6 +92,7 @@ class MessageReassembler:
                 "created_at_ms": packet.created_at_ms,
                 "priority": packet.priority,
                 "fragments": {},
+                "last_updated_ms": now_ms,
             }
 
         message = self.incomplete[message_key]
@@ -98,6 +108,7 @@ class MessageReassembler:
 
         if packet.fragment_index not in message["fragments"]:
             message["fragments"][packet.fragment_index] = packet.payload
+        message["last_updated_ms"] = now_ms
 
         if len(message["fragments"]) != message["fragment_count"]:
             return None
@@ -108,16 +119,27 @@ class MessageReassembler:
         )
         del self.incomplete[message_key]
         self.completed.add(message_key)
+        self.completed_order.append(message_key)
+        if len(self.completed_order) > self.max_completed:
+            oldest = self.completed_order.pop(0)
+            self.completed.discard(oldest)
         return complete_data
 
-    def expire(self, now_ms):
-        """Discard incomplete partial messages whose deadline has passed."""
+    def expire(self, now_ms, stale_after_ms=30000):
+        """Discard expired partial messages and inactive reassembly state."""
         expired = []
         for key, message in list(self.incomplete.items()):
             deadline_ms = message["deadline_ms"]
-            if deadline_ms is None:
-                continue
-            if message["created_at_ms"] + deadline_ms <= now_ms:
+            reliability = message["reliability"]
+            deadline_passed = (
+                deadline_ms is not None
+                and message["created_at_ms"] + deadline_ms <= now_ms
+            )
+            unreliable_inactive = (
+                reliability == Reliability.UNRELIABLE
+                and message["last_updated_ms"] + stale_after_ms <= now_ms
+            )
+            if deadline_passed or unreliable_inactive:
                 expired.append(key)
                 del self.incomplete[key]
         return expired
@@ -130,3 +152,29 @@ class MessageReassembler:
             if key[0] != connection_id
         }
         self.completed = {key for key in self.completed if key[0] != connection_id}
+        self.completed_order = [
+            key for key in self.completed_order if key[0] != connection_id
+        ]
+
+    def buffered_fragments(self, connection_id):
+        """Count fragments currently waiting for message completion."""
+        return sum(
+            len(message["fragments"])
+            for key, message in self.incomplete.items()
+            if key[0] == connection_id
+        )
+
+    def incomplete_messages(self, connection_id):
+        """Count incomplete messages belonging to one connection."""
+        return sum(1 for key in self.incomplete if key[0] == connection_id)
+
+    def message_buffered_bytes(self, connection_id, message_id):
+        """Return bytes held for one incomplete message."""
+        message = self.incomplete.get((connection_id, message_id))
+        if message is None:
+            return 0
+        return sum(len(payload) for payload in message["fragments"].values())
+
+    def has_fragment(self, connection_id, message_id, fragment_index):
+        message = self.incomplete.get((connection_id, message_id))
+        return message is not None and fragment_index in message["fragments"]

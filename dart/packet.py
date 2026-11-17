@@ -1,4 +1,4 @@
-"""Simple binary packet format for DART v3.
+"""Simple binary packet format for DART v4.
 
 This module only knows how to turn packet objects into bytes and back again.
 Networking, retries, and scheduling will be added in separate modules later.
@@ -11,8 +11,10 @@ import uuid
 
 
 MAGIC = b"DART"
-VERSION = 3
+VERSION = 4
 MAX_DATAGRAM_BYTES = 1200
+AUTH_TAG_BYTES = 32
+HANDSHAKE_NONCE_BYTES = 16
 
 # All numbers use network byte order (the ! at the start).
 # Common: magic, version, packet type, flags, connection ID, packet number.
@@ -22,11 +24,12 @@ COMMON_HEADER = struct.Struct("!4sBBHQQ")
 # priority, deadline, creation time, payload length.
 DATA_HEADER = struct.Struct("!16sHHHBBIQH")
 
-# ACK: largest received packet and a bitmap for the previous 64 packets.
-ACK_HEADER = struct.Struct("!QQ")
+# ACK: largest packet, bitmap, current receive window, authentication tag.
+ACK_HEADER = struct.Struct("!QQH32s")
 
-# HELLO and HELLO_ACK: the number of packets the sender can receive.
-HANDSHAKE_HEADER = struct.Struct("!H")
+# HELLO: receive window, random nonce, authentication tag.
+HANDSHAKE_HEADER = struct.Struct("!H16s32s")
+CLOSE_HEADER = struct.Struct("!32s")
 
 DATA_HEADER_BYTES = COMMON_HEADER.size + DATA_HEADER.size
 ACK_PACKET_BYTES = COMMON_HEADER.size + ACK_HEADER.size
@@ -56,6 +59,8 @@ class HelloPacket:
     connection_id: int
     packet_number: int
     receive_window: int
+    nonce: bytes = bytes(HANDSHAKE_NONCE_BYTES)
+    auth_tag: bytes = bytes(AUTH_TAG_BYTES)
     flags: int = 0
 
 
@@ -64,6 +69,8 @@ class HelloAckPacket:
     connection_id: int
     packet_number: int
     receive_window: int
+    nonce: bytes = bytes(HANDSHAKE_NONCE_BYTES)
+    auth_tag: bytes = bytes(AUTH_TAG_BYTES)
     flags: int = 0
 
 
@@ -89,6 +96,8 @@ class AckPacket:
     packet_number: int
     largest_acknowledged: int
     ack_bitmap: int = 0
+    receive_window: int = 1
+    auth_tag: bytes = bytes(AUTH_TAG_BYTES)
     flags: int = 0
 
     def acknowledges(self, packet_number):
@@ -110,6 +119,7 @@ class AckPacket:
 class ClosePacket:
     connection_id: int
     packet_number: int
+    auth_tag: bytes = bytes(AUTH_TAG_BYTES)
     flags: int = 0
 
 
@@ -134,6 +144,10 @@ def encode_packet(packet):
     if isinstance(packet, (HelloPacket, HelloAckPacket)):
         if not valid_number(packet.receive_window, 16) or packet.receive_window == 0:
             raise PacketError("Receive window must be between 1 and 65535")
+        if not isinstance(packet.nonce, bytes) or len(packet.nonce) != HANDSHAKE_NONCE_BYTES:
+            raise PacketError("Handshake nonce must be 16 bytes")
+        if not isinstance(packet.auth_tag, bytes) or len(packet.auth_tag) != AUTH_TAG_BYTES:
+            raise PacketError("Authentication tag must be 32 bytes")
 
         if isinstance(packet, HelloPacket):
             packet_type = PacketType.HELLO
@@ -148,7 +162,11 @@ def encode_packet(packet):
             packet.connection_id,
             packet.packet_number,
         )
-        return common_bytes + HANDSHAKE_HEADER.pack(packet.receive_window)
+        return common_bytes + HANDSHAKE_HEADER.pack(
+            packet.receive_window,
+            packet.nonce,
+            packet.auth_tag,
+        )
 
     if isinstance(packet, DataPacket):
         packet_type = PacketType.DATA
@@ -209,6 +227,10 @@ def encode_packet(packet):
             raise PacketError("Largest acknowledged must be a 64-bit number")
         if not valid_number(packet.ack_bitmap, 64):
             raise PacketError("ACK bitmap must be a 64-bit number")
+        if not valid_number(packet.receive_window, 16) or packet.receive_window == 0:
+            raise PacketError("Receive window must be between 1 and 65535")
+        if not isinstance(packet.auth_tag, bytes) or len(packet.auth_tag) != AUTH_TAG_BYTES:
+            raise PacketError("Authentication tag must be 32 bytes")
 
         common_bytes = COMMON_HEADER.pack(
             MAGIC,
@@ -218,7 +240,12 @@ def encode_packet(packet):
             packet.connection_id,
             packet.packet_number,
         )
-        ack_bytes = ACK_HEADER.pack(packet.largest_acknowledged, packet.ack_bitmap)
+        ack_bytes = ACK_HEADER.pack(
+            packet.largest_acknowledged,
+            packet.ack_bitmap,
+            packet.receive_window,
+            packet.auth_tag,
+        )
         return common_bytes + ack_bytes
 
     common_bytes = COMMON_HEADER.pack(
@@ -229,7 +256,9 @@ def encode_packet(packet):
         packet.connection_id,
         packet.packet_number,
     )
-    return common_bytes
+    if not isinstance(packet.auth_tag, bytes) or len(packet.auth_tag) != AUTH_TAG_BYTES:
+        raise PacketError("Authentication tag must be 32 bytes")
+    return common_bytes + CLOSE_HEADER.pack(packet.auth_tag)
 
 
 def decode_packet(raw):
@@ -258,7 +287,7 @@ def decode_packet(raw):
         if len(body) != HANDSHAKE_HEADER.size:
             raise PacketError("Handshake packet has an invalid length")
 
-        (receive_window,) = HANDSHAKE_HEADER.unpack(body)
+        receive_window, nonce, auth_tag = HANDSHAKE_HEADER.unpack(body)
         if receive_window == 0:
             raise PacketError("Receive window must be between 1 and 65535")
 
@@ -267,6 +296,8 @@ def decode_packet(raw):
             connection_id=connection_id,
             packet_number=packet_number,
             receive_window=receive_window,
+            nonce=nonce,
+            auth_tag=auth_tag,
             flags=flags,
         )
 
@@ -323,21 +354,27 @@ def decode_packet(raw):
         if len(body) != ACK_HEADER.size:
             raise PacketError("ACK packet has an invalid length")
 
-        largest_acknowledged, ack_bitmap = ACK_HEADER.unpack(body)
+        largest_acknowledged, ack_bitmap, receive_window, auth_tag = ACK_HEADER.unpack(body)
+        if receive_window == 0:
+            raise PacketError("Receive window must be between 1 and 65535")
         return AckPacket(
             connection_id=connection_id,
             packet_number=packet_number,
             largest_acknowledged=largest_acknowledged,
             ack_bitmap=ack_bitmap,
+            receive_window=receive_window,
+            auth_tag=auth_tag,
             flags=flags,
         )
 
     if packet_type == PacketType.CLOSE:
-        if body:
+        if len(body) != CLOSE_HEADER.size:
             raise PacketError("CLOSE packet has an invalid length")
+        (auth_tag,) = CLOSE_HEADER.unpack(body)
         return ClosePacket(
             connection_id=connection_id,
             packet_number=packet_number,
+            auth_tag=auth_tag,
             flags=flags,
         )
 

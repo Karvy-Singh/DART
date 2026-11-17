@@ -77,6 +77,41 @@ class FragmentationTests(unittest.TestCase):
         self.assertEqual(expired, [(123, packets[0].message_id)])
         self.assertEqual(reassembler.incomplete, {})
 
+    def test_inactive_unreliable_message_expires(self):
+        packets = fragment_message(
+            b"x" * (MAX_PAYLOAD_BYTES + 10),
+            connection_id=123,
+            first_packet_number=1,
+            reliability=Reliability.UNRELIABLE,
+        )
+        reassembler = MessageReassembler()
+        reassembler.add(packets[0], now_ms=1000)
+
+        expired = reassembler.expire(1100, stale_after_ms=100)
+
+        self.assertEqual(expired, [(123, packets[0].message_id)])
+
+    def test_inactive_reliable_message_does_not_expire(self):
+        packets = self.make_packets(b"x" * (MAX_PAYLOAD_BYTES + 10))
+        reassembler = MessageReassembler()
+        reassembler.add(packets[0], now_ms=1000)
+
+        expired = reassembler.expire(100000, stale_after_ms=100)
+
+        self.assertEqual(expired, [])
+        self.assertEqual(reassembler.incomplete_messages(123), 1)
+
+    def test_completed_history_is_bounded(self):
+        reassembler = MessageReassembler(max_completed=1)
+        first = self.make_packets(b"first")[0]
+        second = self.make_packets(b"second")[0]
+
+        reassembler.add(first)
+        reassembler.add(second)
+
+        self.assertNotIn((first.connection_id, first.message_id), reassembler.completed)
+        self.assertIn((second.connection_id, second.message_id), reassembler.completed)
+
     def test_connection_cleanup_removes_completed_state(self):
         packet = self.make_packets(b"hello")[0]
         reassembler = MessageReassembler()
@@ -85,6 +120,18 @@ class FragmentationTests(unittest.TestCase):
         reassembler.remove_connection(packet.connection_id)
 
         self.assertEqual(reassembler.completed, set())
+
+    def test_buffered_fragment_count_changes_after_completion(self):
+        packets = self.make_packets(b"x" * (MAX_PAYLOAD_BYTES + 10))
+        reassembler = MessageReassembler()
+
+        reassembler.add(packets[0])
+        self.assertEqual(reassembler.buffered_fragments(123), 1)
+        self.assertEqual(reassembler.incomplete_messages(123), 1)
+
+        reassembler.add(packets[1])
+        self.assertEqual(reassembler.buffered_fragments(123), 0)
+        self.assertEqual(reassembler.incomplete_messages(123), 0)
 
 
 if __name__ == "__main__":

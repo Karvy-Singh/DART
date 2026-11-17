@@ -3,6 +3,7 @@ import unittest
 import uuid
 
 from dart.packet import (
+    COMMON_HEADER,
     DATA_HEADER_BYTES,
     MAX_DATAGRAM_BYTES,
     MAX_PAYLOAD_BYTES,
@@ -45,7 +46,7 @@ class HandshakePacketTests(unittest.TestCase):
 
     def test_zero_receive_window_is_rejected_when_decoding(self):
         raw = bytearray(encode_packet(HelloPacket(10, 1, 1)))
-        struct.pack_into("!H", raw, len(raw) - 2, 0)
+        struct.pack_into("!H", raw, COMMON_HEADER.size, 0)
 
         with self.assertRaisesRegex(PacketError, "Receive window"):
             decode_packet(bytes(raw))

@@ -2,12 +2,14 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import socket
 import time
 
 from dart import DeadlineScheduler, Reliability, encode_file, encode_text
 from dart.client import DartClient
+from dart.security import SecurityError, parse_key
 
 
 MODE_NAMES = {
@@ -77,7 +79,7 @@ def load_batch(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DART v3 sender")
+    parser = argparse.ArgumentParser(description="DART v4 sender")
     parser.add_argument("message", nargs="?", help="Text to send")
     parser.add_argument("--file", help="File to send instead of text")
     parser.add_argument("--batch", help="JSON file containing multiple messages")
@@ -90,6 +92,11 @@ def main():
     parser.add_argument("--estimated-rtt-ms", type=int, default=100)
     parser.add_argument("--max-attempts", type=int, default=10)
     parser.add_argument("--window-size", type=int, default=8)
+    parser.add_argument(
+        "--key",
+        default=os.environ.get("DART_PSK"),
+        help="64-hex-character pre-shared key (or set DART_PSK)",
+    )
     args = parser.parse_args()
 
     source_count = sum(
@@ -97,6 +104,8 @@ def main():
     )
     if source_count != 1:
         parser.error("Provide exactly one of message, --file, or --batch")
+    if not args.key:
+        parser.error("Provide --key or set DART_PSK")
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535")
     if min(
@@ -106,8 +115,11 @@ def main():
         args.window_size,
     ) <= 0:
         parser.error("Timing, retry, and window settings must be positive")
+    if args.window_size > 65:
+        parser.error("Window size cannot exceed the 65-packet ACK range")
 
     try:
+        pre_shared_key = parse_key(args.key)
         if args.batch:
             items = load_batch(args.batch)
         elif args.file:
@@ -146,6 +158,7 @@ def main():
             client = DartClient(
                 sock,
                 destination,
+                pre_shared_key,
                 maximum_window=args.window_size,
                 timeout_ms=args.timeout_ms,
                 estimated_rtt_ms=args.estimated_rtt_ms,
@@ -179,7 +192,13 @@ def main():
 
             client.close()
             return 1 if failed else 0
-    except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
+    except (
+        ConnectionError,
+        OSError,
+        SecurityError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
         print(f"[SENDER  ] ERROR: {error}")
         return 1
 

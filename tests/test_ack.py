@@ -35,6 +35,17 @@ class AckTrackerTests(unittest.TestCase):
 
         self.assertTrue(ack.acknowledges(0))
 
+    def test_duplicate_and_old_packet_detection(self):
+        tracker = AckTracker()
+        tracker.add(65)
+
+        self.assertTrue(tracker.has_received(65))
+        self.assertFalse(tracker.has_received(0))
+        self.assertFalse(tracker.has_received(66))
+
+        tracker.add(0)
+        self.assertTrue(tracker.has_received(0))
+
 
 if __name__ == "__main__":
     unittest.main()

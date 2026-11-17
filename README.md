@@ -8,19 +8,37 @@ The current project is a runnable minimum transport: it can send text and files
 between two devices using DART's own packet format, fragmentation, ACKs,
 retransmission, sliding window, RTT estimation, and basic congestion control.
 
-The runnable sender and receiver now use the DART v3 binary packet format. A
+The runnable sender and receiver now use the DART v4 binary packet format. A
 message is split into UDP-sized fragments, each fragment is acknowledged and
 retried when required, and the receiver reassembles the original message before
 delivering it.
 
 This is still a deliberately simple prototype, but it now includes connection
-handshakes, deadline scheduling, receiver expiration, receiver-advertised flow
-limits, packet pacing, and reproducible network impairment controls. It does not
-provide production-grade security or congestion fairness.
+handshakes, deadline scheduling, receiver expiration, dynamic receiver-advertised
+flow limits, packet pacing, authenticated encryption, and reproducible network
+impairment controls. It does not provide production-grade congestion fairness.
 
-The proposed v3 protocol and its delivery semantics are specified in
-[`docs/protocol-v3.md`](docs/protocol-v3.md). Features described there may still
+The proposed v4 protocol and its delivery semantics are specified in
+[`docs/protocol-v4.md`](docs/protocol-v4.md). Features described there may still
 be future targets unless the README says they are implemented.
+
+## Setup
+
+Install the encryption dependency:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Generate one 32-byte pre-shared key and configure the same key on both devices:
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+export DART_PSK=<64-hex-character-key>
+```
+
+Alternatively, pass the key to both commands using `--key`. Environment variables
+are preferable because command-line arguments can be stored in shell history.
 
 ## Run the Demo
 
@@ -114,7 +132,8 @@ the text only after every fragment has arrived.
 
 - Binary `DATA` and `ACK` packets.
 - 64-bit connection and packet numbers.
-- Messages split into payloads of at most 1138 bytes.
+- Messages split into plaintext payloads of at most 1122 bytes. AEAD adds a
+  16-byte authentication tag to each DATA packet.
 - Out-of-order reassembly and duplicate suppression.
 - A sliding window with a configurable maximum size.
 - Minimal AIMD congestion control: additive growth after ACKs and window halving
@@ -126,26 +145,34 @@ the text only after every fragment has arrived.
 - Unreliable, partial, and reliable sending modes.
 - Sender-side deadline abandonment based on the estimated time needed for all
   remaining fragments.
-- Simulated data loss, ACK loss, delay, and first-send loss.
 - Text and binary file transfer applications.
 - `HELLO`, `HELLO_ACK`, and `CLOSE` connection state machine.
 - Earliest-deadline-first scheduling for JSON message batches.
 - Receiver-side expiration of stale partial messages.
 - Receiver-advertised maximum in-flight window.
+- Dynamic receive-window updates in authenticated ACK packets.
 - RTT-based packet pacing.
 - Seeded loss, ACK loss, delay, jitter, and first-send-loss simulation.
+- ChaCha20-Poly1305 DATA encryption and authentication.
+- HMAC-SHA256 authentication for handshake, ACK, and CLOSE packets.
+- Per-connection keys derived from the pre-shared key and random handshake
+  nonces.
 
 ## Not Implemented Yet
 
-- Encryption or authentication.
-- Dynamic flow-window updates after the handshake.
 - Production-grade congestion control and fairness.
+- Forward secrecy and automatic key rotation.
 - Clock-offset negotiation; physical devices should synchronize their clocks
   for accurate receiver-side deadline decisions.
 
-This is an educational prototype. Do not expose it directly to the public
-internet because packets and transferred files are not encrypted or
-authenticated.
+This is an educational prototype. Keep the pre-shared key private and use a new
+random key for each deployment.
+
+The receiver limits each message to 16 MiB by default and limits concurrent
+incomplete messages using `--receive-window`. Change the per-message limit with
+`--max-message-bytes` when transferring larger files. Inactive incomplete
+messages are removed after 30 seconds by default; configure this with
+`--reassembly-timeout-ms`.
 
 ## Run Tests
 

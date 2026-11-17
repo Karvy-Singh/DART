@@ -1,4 +1,4 @@
-"""DART v3 transport package."""
+"""DART v4 transport package."""
 
 from .ack import AckTracker
 from .application import decode_message, encode_file, encode_text
